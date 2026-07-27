@@ -2,8 +2,8 @@
 //!
 //! Ports of the two trajectory estimators from
 //! `notebook/rogii-another-approch-2nd.ipynb` to
-//! [CubeCL](https://github.com/tracel-ai/cubecl), with CUDA, wgpu and CPU
-//! backends and Python bindings:
+//! [CubeCL](https://github.com/tracel-ai/cubecl), with CUDA, ROCm/HIP, wgpu and
+//! CPU backends and Python bindings:
 //!
 //! * the 128-seed likelihood-weighted **particle filter** (`_pf_lik_allseeds` /
 //!   `lik_pf`), which produces the `pf_scale_*` channels, and
@@ -104,9 +104,11 @@ impl PfOutput {
 /// Which CubeCL backend to run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// Pick CUDA, then wgpu, then CPU, depending on what is compiled in and
-    /// initialises successfully.
+    /// Pick HIP (ROCm), then CUDA, then wgpu, then CPU, depending on what
+    /// is compiled in and initialises successfully.
     Auto,
+    /// AMD ROCm / HIP.
+    Hip,
     /// NVIDIA CUDA (the Kaggle T4 path).
     Cuda,
     /// wgpu (Vulkan/Metal/DX12).
@@ -120,6 +122,7 @@ impl std::str::FromStr for Backend {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "auto" => Ok(Backend::Auto),
+            "hip" | "rocm" => Ok(Backend::Hip),
             "cuda" | "gpu" => Ok(Backend::Cuda),
             "wgpu" | "vulkan" | "metal" => Ok(Backend::Wgpu),
             "cpu" => Ok(Backend::Cpu),
@@ -131,6 +134,8 @@ impl std::str::FromStr for Backend {
 /// Backends this build can actually use, in `Auto` preference order.
 pub fn available_backends() -> Vec<Backend> {
     [
+        #[cfg(feature = "hip")]
+        Backend::Hip,
         #[cfg(feature = "cuda")]
         Backend::Cuda,
         #[cfg(feature = "wgpu")]
@@ -149,6 +154,16 @@ macro_rules! on_backend {
     ($backend:expr, $auto:expr, $call:path, $($arg:expr),* $(,)?) => {
         match $backend {
             Backend::Auto => $auto,
+            Backend::Hip => {
+                #[cfg(feature = "hip")]
+                {
+                    let device = cubecl::hip::AmdDevice::default();
+                    let client = <cubecl::hip::HipRuntime as cubecl::Runtime>::client(&device);
+                    $call(&client, $($arg),*)
+                }
+                #[cfg(not(feature = "hip"))]
+                Err(PfError::NoBackend("built without the `hip` feature".into()))
+            }
             Backend::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
@@ -183,13 +198,13 @@ macro_rules! on_backend {
     };
 }
 
-/// Tries every compiled-in backend in `Auto` preference order.
+/// Tries every compiled-in backend in `Auto` preference order (HIP → CUDA → wgpu → CPU).
 macro_rules! first_working_backend {
     ($run:expr) => {{
         let candidates = available_backends();
         if candidates.is_empty() {
             return Err(PfError::NoBackend(
-                "compile with one of the `cuda`, `wgpu` or `cpu` features".into(),
+                "compile with one of the `hip`, `cuda`, `wgpu` or `cpu` features".into(),
             ));
         }
         let mut last = None;

@@ -112,14 +112,24 @@ deviation (expect ~1e-5 ft — pure f32 rounding).
 ### Python wheel
 
 ```bash
+# NVIDIA CUDA (Kaggle T4)
 maturin build --release --no-default-features \
   --features 'pyo3/extension-module,python,cuda' -o dist
-pip install dist/rog2_pf-*.whl
+
+# AMD ROCm / HIP
+maturin build --release --no-default-features \
+  --features 'pyo3/extension-module,python,hip' -o dist
+
+# CPU-only (no GPU needed)
+maturin build --release --no-default-features \
+  --features 'pyo3/extension-module,python,cpu' -o dist
+
+pip install dist/rog2_algorithm-*.whl
 ```
 
-Swap `cuda` for `cpu` on a machine without an NVIDIA toolkit. `cubecl-cuda`'s
-build script reads the CUDA version from the toolkit, so `nvcc` must be on
-`PATH` when building with the `cuda` feature.
+* `cuda` — requires `nvcc` on `PATH` (NVIDIA CUDA Toolkit).
+* `hip` — requires `hipcc` on `PATH` (AMD ROCm).
+* `cpu` — works anywhere, no GPU required.
 
 ## Using it from the competition notebook
 

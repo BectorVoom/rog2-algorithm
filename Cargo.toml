@@ -26,6 +26,7 @@ default = ["cpu"]
 # CubeCL backends
 cpu = ["cubecl/cpu"]
 cuda = ["cubecl/cuda"]
+hip = ["cubecl/hip"]
 wgpu = ["cubecl/wgpu"]
 # Python extension module (maturin builds with this)
 python = ["dep:pyo3", "dep:numpy", "pyo3/extension-module"]
@@ -37,6 +38,11 @@ checked-launch = []
 [[bin]]
 name = "pf-bench"
 path = "src/bin/pf_bench.rs"
+required-features = ["cpu"]
+
+[[bin]]
+name = "beam-bench"
+path = "src/bin/beam_bench.rs"
 required-features = ["cpu"]
 
 [profile.release]

@@ -1,37 +1,60 @@
-"""GPU particle filter for the ROGII wellbore-geology competition.
+"""GPU trackers for the ROGII wellbore-geology competition.
 
-This package wraps the CubeCL/CUDA port of the notebook's 128-seed
-likelihood-weighted particle filter (``_pf_lik_allseeds`` / ``lik_pf`` in
-``notebook/rogii-another-approch-2nd.ipynb``).
+This package wraps the CubeCL/CUDA port of the two trajectory estimators in
+``notebook/rogii-another-approch-2nd.ipynb``:
 
-The native entry point is :func:`run_batch`, which takes *all* wells at once so
-one launch fills the GPU. :func:`lik_pf` and :func:`lik_pf_batch` are drop-in
-replacements for the notebook's helpers and take the same pandas frames.
+* the 128-seed likelihood-weighted particle filter (``_pf_lik_allseeds`` /
+  ``lik_pf``), and
+* the 14-config beam search (``beam_search`` / ``run_beam_ensemble``).
 
-    from rog2_pf import lik_pf_batch
+The native entry points are :func:`run_batch` and :func:`run_beam_batch`, which
+take *all* wells at once so one launch fills the GPU. :func:`lik_pf`,
+:func:`lik_pf_batch`, :func:`run_beam_ensemble` and
+:func:`run_beam_ensemble_batch` are drop-in replacements for the notebook's
+helpers and take the same pandas frames.
+
+    from rog2_pf import lik_pf_batch, run_beam_ensemble_batch
     results = lik_pf_batch([(hw, tw) for hw, tw in wells])
     out, ev_index, quality = results[0]
     out["pf_scale_3"]  # np.ndarray over the evaluation rows
+
+    tvt_beam = run_beam_ensemble_batch([(hw, tw) for hw, tw in wells])[0]
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from ._rog2_pf import __version__, available_backends, make_grid, run_batch
+from ._rog2_pf import (
+    __version__,
+    available_backends,
+    make_grid,
+    notebook_beam_configs,
+    run_batch,
+    run_beam_batch,
+)
 
 __all__ = [
     "__version__",
     "available_backends",
     "make_grid",
     "run_batch",
+    "run_beam_batch",
     "prepare_well",
+    "prepare_beam_well",
     "lik_pf",
     "lik_pf_batch",
+    "beam_search",
+    "run_beam_ensemble",
+    "run_beam_ensemble_batch",
     "DEFAULT_SCALES",
+    "BEAM_CONFIGS",
 ]
 
 DEFAULT_SCALES = (3.0, 5.0, 8.0, 12.0)
+
+#: The notebook's ``BEAM_CONFIGS``, as ``(bs, mc, es, r)`` tuples.
+BEAM_CONFIGS = tuple(notebook_beam_configs())
 
 # Matches the notebook's `_pf_lik_allseeds` call site.
 _PF_MOM = 0.998
@@ -193,3 +216,108 @@ def lik_pf(hw, tw, **kwargs):
     """
     seed_base = kwargs.pop("seed_base", 0)
     return lik_pf_batch([(hw, tw)], seed_bases=[seed_base], **kwargs)[0]
+
+
+# ---------------------------------------------------------------------------
+# Beam search
+# ---------------------------------------------------------------------------
+
+
+def prepare_beam_well(hw, tw):
+    """Turn one ``(horizontal_well, typewell)`` pair into a beam-kernel input dict.
+
+    This reproduces the setup block of the notebook's ``run_beam_ensemble``.
+    Returns ``(well_dict, ev_index)``, or ``(None, empty_index)`` when the well
+    has no evaluation rows.
+    """
+    ev = hw[hw.TVT_input.isna()]
+    kn = hw[hw.TVT_input.notna()]
+    if len(ev) == 0 or len(kn) == 0:
+        return None, ev.index.values
+
+    tw_s = tw.sort_values("TVT")
+    tw_tvt = tw_s.TVT.values.astype(np.float64)
+    tw_gr = tw_s.GR.fillna(tw_s.GR.mean()).values.astype(np.float64)
+
+    gr_all = (
+        hw.GR.interpolate(limit_direction="both")
+        .fillna(tw_gr.mean())
+        .values.astype(np.float64)
+    )
+
+    well = {
+        "gr": gr_all[ev.index].astype(np.float32),
+        "tw_tvt": tw_tvt.astype(np.float32),
+        "tw_gr": tw_gr.astype(np.float32),
+        "last_tvt": float(kn.iloc[-1].TVT_input),
+    }
+    return well, ev.index.values
+
+
+def run_beam_ensemble_batch(pairs, configs=None, backend="auto", cube_dim=64, **kwargs):
+    """Batched drop-in for the notebook's ``run_beam_ensemble``.
+
+    ``pairs`` is a sequence of ``(hw, tw)`` DataFrames. Returns one array per
+    input pair, laid out like ``hw.TVT_input``: known rows keep their input TVT
+    and evaluation rows carry the ensemble mean, exactly as the notebook's
+    per-well function returns.
+
+    Batching is the whole point: 14 configs x N wells become one grid, so a T4
+    stays saturated instead of running one config at a time in Python.
+    """
+    prepared, indices, outs = [], [], []
+    for hw, tw in pairs:
+        well, ev_index = prepare_beam_well(hw, tw)
+        prepared.append(well)
+        indices.append(ev_index)
+        outs.append(hw.TVT_input.values.astype(float).copy())
+
+    live = [w for w in prepared if w is not None]
+    if not live:
+        return outs
+
+    res = run_beam_batch(
+        live,
+        configs=None if configs is None else [tuple(c) for c in configs],
+        backend=backend,
+        cube_dim=int(cube_dim),
+        **kwargs,
+    )
+
+    live_positions = [i for i, w in enumerate(prepared) if w is not None]
+    for slot, i in enumerate(live_positions):
+        outs[i][list(indices[i])] = res["beam_mean"][slot]
+    return outs
+
+
+def run_beam_ensemble(hw, tw, **kwargs):
+    """Single-well drop-in for the notebook's ``run_beam_ensemble``.
+
+    Prefer :func:`run_beam_ensemble_batch`: one well's 14 configs cannot fill a
+    GPU, so per-well calls pay full launch overhead for a fraction of the
+    throughput.
+    """
+    return run_beam_ensemble_batch([(hw, tw)], **kwargs)[0]
+
+
+def beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs=10, mc=20.0, es=144.0, r=2, **kwargs):
+    """Single-config drop-in for the notebook's ``beam_search``.
+
+    Signature and defaults match the original. Returns the tracked TVT for every
+    row of ``hgr``.
+    """
+    hgr = np.asarray(hgr, dtype=np.float32)
+    if len(hgr) == 0:
+        return np.array([float(last_tvt)])
+
+    order = np.argsort(np.asarray(tw_tvt, dtype=np.float64), kind="stable")
+    well = {
+        "gr": hgr,
+        "tw_tvt": np.asarray(tw_tvt, dtype=np.float32)[order],
+        "tw_gr": np.asarray(tw_gr, dtype=np.float32)[order],
+        "last_tvt": float(last_tvt),
+    }
+    res = run_beam_batch(
+        [well], configs=[(int(bs), float(mc), float(es), int(r))], **kwargs
+    )
+    return np.asarray(res["beam_mean"][0], dtype=float)

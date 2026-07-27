@@ -10,7 +10,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::batch::{PfConfig, WellInput};
-use crate::{Backend, PfError, run_on};
+use crate::beam::{BeamConfig, BeamOptions, BeamWellInput, NOTEBOOK_BEAM_CONFIGS};
+use crate::{Backend, PfError, run_beam_on, run_on};
 
 fn err(e: PfError) -> PyErr {
     match e {
@@ -170,6 +171,115 @@ fn run_batch<'py>(
     Ok(result)
 }
 
+fn parse_beam_well(obj: &Bound<'_, PyAny>) -> PyResult<BeamWellInput> {
+    let d = obj
+        .cast::<PyDict>()
+        .map_err(|_| PyValueError::new_err("each well must be a dict"))?;
+    Ok(BeamWellInput {
+        gr: as_f32_vec(&item(d, "gr")?, "gr")?,
+        tw_tvt: as_f32_vec(&item(d, "tw_tvt")?, "tw_tvt")?,
+        tw_gr: as_f32_vec(&item(d, "tw_gr")?, "tw_gr")?,
+        last_tvt: scalar(d, "last_tvt", None)?,
+    })
+}
+
+/// Parses the notebook's `BEAM_CONFIGS` shape: a sequence of
+/// `(beam_size, move_cost, err_scale, radius)` tuples.
+fn parse_beam_configs(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<BeamConfig>> {
+    let Some(obj) = obj else {
+        return Ok(NOTEBOOK_BEAM_CONFIGS.to_vec());
+    };
+    if obj.is_none() {
+        return Ok(NOTEBOOK_BEAM_CONFIGS.to_vec());
+    }
+    let raw: Vec<(u32, f64, f64, u32)> = obj.extract().map_err(|_| {
+        PyValueError::new_err(
+            "`configs` must be a sequence of (beam_size, move_cost, err_scale, radius) tuples",
+        )
+    })?;
+    Ok(raw
+        .into_iter()
+        .map(|(bs, mc, es, r)| BeamConfig::new(bs, mc as f32, es as f32, r))
+        .collect())
+}
+
+/// Runs the beam-search ensemble over a batch of wells.
+///
+/// `wells` is a list of dicts with keys `gr` (evaluation-zone gamma ray),
+/// `tw_tvt` and `tw_gr` (the type-well log, sorted ascending by TVT), and
+/// `last_tvt` (the TVT the search starts from).
+///
+/// Returns a dict with `beam_mean` (a list of per-well float32 arrays, the
+/// ensemble mean over configs), `kept` (indices of the input wells that had a
+/// non-empty evaluation zone) and, when `with_per_config` is set, `per_config`
+/// (`[config][well]` arrays).
+#[pyfunction]
+#[pyo3(signature = (
+    wells,
+    configs = None,
+    cube_dim = 64,
+    backend = "auto",
+    with_per_config = false,
+    budget_mb = 512,
+))]
+fn run_beam_batch<'py>(
+    py: Python<'py>,
+    wells: &Bound<'py, PyList>,
+    configs: Option<&Bound<'py, PyAny>>,
+    cube_dim: u32,
+    backend: &str,
+    with_per_config: bool,
+    budget_mb: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let parsed: Vec<BeamWellInput> = wells
+        .iter()
+        .map(|w| parse_beam_well(&w))
+        .collect::<PyResult<_>>()?;
+    let configs = parse_beam_configs(configs)?;
+    let backend: Backend = backend.parse().map_err(err)?;
+    let opts = BeamOptions {
+        cube_dim,
+        with_per_config,
+        budget_bytes: budget_mb << 20,
+    };
+
+    // The kernel does not touch Python state, so other threads can run.
+    let out = py
+        .detach(|| run_beam_on(backend, &parsed, &configs, &opts))
+        .map_err(err)?;
+
+    let result = PyDict::new(py);
+    let per_well = PyList::empty(py);
+    for w in 0..out.ev_lens.len() {
+        per_well.append(out.well_mean(w).unwrap().to_vec().into_pyarray(py))?;
+    }
+    result.set_item("beam_mean", per_well)?;
+
+    if with_per_config {
+        let by_config = PyList::empty(py);
+        for c in 0..configs.len() {
+            let rows = PyList::empty(py);
+            for w in 0..out.ev_lens.len() {
+                rows.append(out.well_config(c, w).unwrap().to_vec().into_pyarray(py))?;
+            }
+            by_config.append(rows)?;
+        }
+        result.set_item("per_config", by_config)?;
+    }
+    result.set_item("kept", out.kept)?;
+    Ok(result)
+}
+
+/// The notebook's `BEAM_CONFIGS`, as `(beam_size, move_cost, err_scale, radius)`
+/// tuples — the default ensemble `run_beam_batch` uses.
+#[pyfunction]
+fn notebook_beam_configs() -> Vec<(u32, f32, f32, u32)> {
+    NOTEBOOK_BEAM_CONFIGS
+        .iter()
+        .map(|c| (c.beam_size, c.move_cost, c.err_scale, c.radius))
+        .collect()
+}
+
 /// Backends this build can use, most preferred first.
 #[pyfunction]
 fn available_backends() -> Vec<String> {
@@ -222,6 +332,8 @@ fn make_grid<'py>(
 #[pymodule]
 fn _rog2_pf(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(run_beam_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(notebook_beam_configs, m)?)?;
     m.add_function(wrap_pyfunction!(available_backends, m)?)?;
     m.add_function(wrap_pyfunction!(make_grid, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
