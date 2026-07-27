@@ -1,0 +1,45 @@
+[package]
+name = "rog2-algorithm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rog2_pf"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0.104"
+thiserror = "2.0.19"
+cubecl = { version = "0.10.0" }
+cubek-std = { version = "0.2.0" }
+bytemuck = "1.25"
+half = "2.7"
+
+pyo3 = { version = "0.29.0", optional = true, features = ["abi3-py39"] }
+numpy = { version = "0.29.0", optional = true }
+
+[dev-dependencies]
+rand = "0.9"
+
+[features]
+default = ["cpu"]
+# CubeCL backends
+cpu = ["cubecl/cpu"]
+cuda = ["cubecl/cuda"]
+wgpu = ["cubecl/wgpu"]
+# Python extension module (maturin builds with this)
+python = ["dep:pyo3", "dep:numpy", "pyo3/extension-module"]
+# Python bindings without the extension-module link mode (for `cargo test`)
+python-test = ["dep:pyo3", "dep:numpy"]
+# Use bounds-checked kernel launches (slower, catches indexing bugs)
+checked-launch = []
+
+[[bin]]
+name = "pf-bench"
+path = "src/bin/pf_bench.rs"
+required-features = ["cpu"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
