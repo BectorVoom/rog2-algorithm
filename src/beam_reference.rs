@@ -81,6 +81,11 @@ fn nearest_index(tw: &[f32], v: f32) -> usize {
         };
         if d_prev <= d_cur {
             si = lo - 1;
+            // np.argmin returns the first minimum, so back up over a run of
+            // samples logging the identical TVT.
+            while si > 0 && tw[si - 1] == tw[si] {
+                si -= 1;
+            }
         }
     }
     si

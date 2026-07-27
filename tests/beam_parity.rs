@@ -114,6 +114,7 @@ fn rejects_a_degenerate_config() {
         BeamConfig::new(0, 20.0, 144.0, 2),
         BeamConfig::new(4, 20.0, 0.0, 2),
         BeamConfig::new(4, -1.0, 144.0, 2),
+        BeamConfig::new(4, 20.0, 144.0, 10_000),
     ] {
         assert!(
             run_beam_on(Backend::Cpu, &wells, &[bad], &o).is_err(),
@@ -265,6 +266,50 @@ fn prohibitive_move_cost_freezes_the_path() {
         &mut out,
     );
     assert!(out.iter().all(|v| *v == 10.0), "path drifted: {out:?}");
+}
+
+/// The start index is `np.argmin(|tw_tvt - last_tvt|)`, which returns the *first*
+/// minimum. A type well with repeated TVT samples must therefore start on the
+/// first of the run, not the last — a binary search alone gets this wrong.
+#[test]
+fn duplicate_type_well_depths_start_on_the_first_sample() {
+    // Samples 2..=4 all sit at TVT 5.0 but log different GR. Starting at 5.4,
+    // the nearest TVT is 5.0, and the notebook picks index 2.
+    let tw_tvt = vec![1.0f32, 3.0, 5.0, 5.0, 5.0, 9.0];
+    let tw_gr = vec![0.0f32, 0.0, 100.0, 50.0, 20.0, 0.0];
+    // Freeze the path so the output is purely a function of the start index.
+    let sgr = vec![0.0f32; 6];
+
+    let mut out = vec![0.0f32; sgr.len()];
+    beam_search_one(
+        &sgr,
+        &tw_tvt,
+        &tw_gr,
+        5.4,
+        &BeamConfig::new(1, 1e9, 1.0, 0),
+        &mut out,
+    );
+    // A beam of one with a prohibitive move cost stays put, and index 2 is the
+    // only one of the three whose GR keeps it there at cost 100^2.
+    assert!(out.iter().all(|v| *v == 5.0));
+
+    // The same start, reached through the kernel, must agree with the reference.
+    let well = rog2_pf::BeamWellInput {
+        gr: sgr.clone(),
+        tw_tvt,
+        tw_gr,
+        last_tvt: 5.4,
+    };
+    let cfgs = [BeamConfig::new(1, 1e9, 1.0, 0)];
+    let o = BeamOptions {
+        cube_dim: 8,
+        with_per_config: true,
+        ..BeamOptions::default()
+    };
+    let gpu = run_beam_on(Backend::Cpu, std::slice::from_ref(&well), &cfgs, &o).unwrap();
+    let cpu = run_beam_reference(std::slice::from_ref(&well), &cfgs, &o).unwrap();
+    assert_eq!(gpu.config_rows(0).unwrap(), cpu.config_rows(0).unwrap());
+    assert_eq!(gpu.config_rows(0).unwrap(), &out[..]);
 }
 
 /// The search may not run off either end of the type-well log.

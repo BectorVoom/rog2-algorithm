@@ -8,6 +8,10 @@
 /// The five moves the search may take on the type-well index grid: `-2..=2`.
 pub const N_MOVES: usize = 5;
 
+/// Largest accepted Savitzky-Golay half-window. The notebook's widest is 5; the
+/// cap exists so a mistyped radius cannot turn into a very long kernel.
+pub const MAX_RADIUS: u32 = 64;
+
 /// Number of `u32` metadata slots per well.
 pub const BEAM_META_U_STRIDE: usize = 4;
 /// Number of float metadata slots per well.
@@ -113,6 +117,15 @@ impl BeamOptions {
                 return Err(crate::PfError::Config(format!(
                     "beam config {i}: move_cost must be non-negative, got {}",
                     c.move_cost
+                )));
+            }
+            // The smoother's window loop runs `2 * radius + 1` times per row, so
+            // an accidental huge radius would silently turn into a very long
+            // kernel. The notebook's widest is 5.
+            if c.radius > MAX_RADIUS {
+                return Err(crate::PfError::Config(format!(
+                    "beam config {i}: radius must be <= {MAX_RADIUS}, got {}",
+                    c.radius
                 )));
             }
         }

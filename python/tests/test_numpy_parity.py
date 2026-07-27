@@ -9,6 +9,13 @@ Run with any backend:
 
     python -m pytest python/tests/test_numpy_parity.py
     ROG2_BACKEND=cuda python -m pytest python/tests/test_numpy_parity.py
+
+The wells here are deliberately short. On CUDA the whole file runs in seconds and
+could use thousands of rows, but a CPU-only build falls back to CubeCL's *CPU
+runtime*, which interprets the kernel and is ~1000x slower than native code —
+a few hundred rows there already costs minutes. The full-scale comparison, on
+real competition wells, is `kaggle/rog2-beam-cubecl-t4.ipynb`. Set
+`ROG2_ROWS` to override.
 """
 
 from __future__ import annotations
@@ -22,6 +29,10 @@ from scipy.signal import savgol_filter
 import rog2_pf
 
 BACKEND = os.environ.get("ROG2_BACKEND", "auto")
+
+#: Evaluation rows per synthetic well. Long enough for the beam to converge and
+#: for both smoothing edges to be exercised, short enough for the interpreter.
+ROWS = int(os.environ.get("ROG2_ROWS", "120"))
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +120,8 @@ def same_sample(a, b):
     return float(np.mean(np.abs(np.asarray(a) - np.asarray(b)) < SAME_SAMPLE_FT))
 
 
-def make_well(seed, n_rows, nt=800):
+def make_well(seed, n_rows=None, nt=400):
+    n_rows = ROWS if n_rows is None else n_rows
     rng = np.random.default_rng(seed)
 
     # An aperiodic GR log: a smoothed random walk, so the search can localise.
@@ -145,7 +157,7 @@ CASES = [
 
 @pytest.mark.parametrize("cfg", CASES)
 def test_single_config_matches_numpy(cfg):
-    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=3, n_rows=250)
+    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=3)
     bs, mc, es, r = cfg
 
     want = nb_beam_search(hgr, tw_tvt, tw_gr, last, bs, mc, es, r)
@@ -171,7 +183,7 @@ def test_savgol_matches_scipy(r):
     smooth, and once on a series scipy already smoothed with ``radius = 0``. Any
     difference is then attributable to the smoother alone, edge rows included.
     """
-    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=11, n_rows=250)
+    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=11)
 
     common = dict(bs=10, mc=20.0, es=144.0, backend=BACKEND)
     want = rog2_pf.beam_search(
@@ -184,7 +196,7 @@ def test_savgol_matches_scipy(r):
 
 
 def test_ensemble_matches_the_notebook():
-    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=8, n_rows=200)
+    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=8)
 
     want = np.stack(
         [nb_beam_search(hgr, tw_tvt, tw_gr, last, *c) for c in rog2_pf.BEAM_CONFIGS], 0
@@ -207,38 +219,38 @@ def test_ensemble_matches_the_notebook():
     assert rmse < 1.0, f"ensemble RMSE {rmse} ft vs the notebook"
 
 
-def test_batching_matches_well_at_a_time():
-    wells = [make_well(seed=s, n_rows=120) for s in (1, 2, 3)]
-    dicts = [
-        {
-            "gr": w[0].astype(np.float32),
-            "tw_tvt": w[1].astype(np.float32),
-            "tw_gr": w[2].astype(np.float32),
-            "last_tvt": w[3],
-        }
-        for w in wells
-    ]
+# These two exercise host-side batching, not the search, so they use one narrow
+# config instead of the notebook's 14 — on the CPU interpreter that is the
+# difference between seconds and many minutes.
+PLUMBING_CONFIGS = [(4, 20.0, 144.0, 2)]
 
-    together = rog2_pf.run_beam_batch(dicts, backend=BACKEND)["beam_mean"]
+
+def as_dict(well):
+    hgr, tw_tvt, tw_gr, last, _ = well
+    return {
+        "gr": np.asarray(hgr, dtype=np.float32),
+        "tw_tvt": tw_tvt.astype(np.float32),
+        "tw_gr": tw_gr.astype(np.float32),
+        "last_tvt": last,
+    }
+
+
+def test_batching_matches_well_at_a_time():
+    dicts = [as_dict(make_well(seed=s, n_rows=60)) for s in (1, 2)]
+
+    kw = dict(configs=PLUMBING_CONFIGS, backend=BACKEND)
+    together = rog2_pf.run_beam_batch(dicts, **kw)["beam_mean"]
     for i, d in enumerate(dicts):
-        alone = rog2_pf.run_beam_batch([d], backend=BACKEND)["beam_mean"][0]
+        alone = rog2_pf.run_beam_batch([d], **kw)["beam_mean"][0]
         np.testing.assert_array_equal(together[i], alone)
 
 
 def test_empty_evaluation_zone_is_dropped():
-    hgr, tw_tvt, tw_gr, last, _ = make_well(seed=4, n_rows=50)
-    empty = {
-        "gr": np.zeros(0, dtype=np.float32),
-        "tw_tvt": tw_tvt.astype(np.float32),
-        "tw_gr": tw_gr.astype(np.float32),
-        "last_tvt": last,
-    }
-    live = {
-        "gr": hgr.astype(np.float32),
-        "tw_tvt": tw_tvt.astype(np.float32),
-        "tw_gr": tw_gr.astype(np.float32),
-        "last_tvt": last,
-    }
-    res = rog2_pf.run_beam_batch([empty, live], backend=BACKEND)
+    live = as_dict(make_well(seed=4, n_rows=40))
+    empty = dict(live, gr=np.zeros(0, dtype=np.float32))
+
+    res = rog2_pf.run_beam_batch(
+        [empty, live], configs=PLUMBING_CONFIGS, backend=BACKEND
+    )
     assert list(res["kept"]) == [1]
     assert len(res["beam_mean"]) == 1

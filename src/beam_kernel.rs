@@ -110,12 +110,14 @@ pub fn sg_smooth_kernel<F: Float + CubeElement>(
         if m > 0 && ev_len > 3 && ev_len > 2 * m + 1 {
             let w = 2 * m + 1;
 
-            // Window start, and where in centred coordinates this row sits.
-            let mut s = i - m;
-            if i < m {
-                s = 0;
-            } else if i + m >= ev_len {
+            // Window start, and where in centred coordinates this row sits. The
+            // two edge cases cannot both apply: that would need `ev_len < 2 * m`,
+            // which the guard above already excludes.
+            let mut s = 0usize;
+            if i + m >= ev_len {
                 s = ev_len - w;
+            } else if i >= m {
+                s = i - m;
             }
             let xe = F::cast_from(i) - F::cast_from(s) - F::cast_from(m);
 
@@ -175,6 +177,8 @@ fn nearest_index<F: Float>(tw: &Array<F>, off: usize, len: usize, v: F) -> usize
     }
 
     // `lo` is the first sample at or above `v`; the nearest is `lo` or `lo - 1`.
+    // `lo` is already the first index holding its value, so only the `lo - 1`
+    // branch has to walk back over a run of equal TVTs to stay first-minimum.
     let mut si = lo;
     if lo >= len {
         si = len - 1;
@@ -187,7 +191,23 @@ fn nearest_index<F: Float>(tw: &Array<F>, off: usize, len: usize, v: F) -> usize
         }
         // `<=`, not `<`: np.argmin returns the *first* minimum.
         if d_prev <= d_cur {
-            si = lo - 1;
+            // A second lower_bound, this time on the value itself: if several
+            // samples log the identical TVT, argmin names the first of them, and
+            // `lo - 1` is the last. Searching beats walking back one at a time,
+            // and unlike a `while si > 0 && tw[si - 1] == dup` walk it cannot
+            // form an out-of-range index — CubeCL's `&&` evaluates both sides.
+            let dup = tw[off + lo - 1];
+            let mut a = 0usize;
+            let mut b = lo - 1;
+            while a < b {
+                let mid = (a + b) / 2;
+                if tw[off + mid] < dup {
+                    a = mid + 1;
+                } else {
+                    b = mid;
+                }
+            }
+            si = a;
         }
     }
     si

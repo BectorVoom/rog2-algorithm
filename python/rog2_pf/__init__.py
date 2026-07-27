@@ -13,6 +13,18 @@ take *all* wells at once so one launch fills the GPU. :func:`lik_pf`,
 :func:`run_beam_ensemble_batch` are drop-in replacements for the notebook's
 helpers and take the same pandas frames.
 
+Backends are selected via the ``backend`` parameter (``"cuda"``, ``"wgpu"``,
+``"hip"`` / ``"rocm"``, ``"cpu"``, or ``"auto"``). The shipped wheel bundles
+CUDA + wgpu + CPU for NVIDIA/macOS/CPU systems. For AMD ROCm GPUs, build from
+source::
+
+    pip install rog2-algorithm --no-binary :all:
+    # or build manually:
+    maturin build --release --features pyo3/extension-module,python,hip
+
+The main wheel works on Kaggle T4s, local Vulkan/Metal GPUs, and CPU-only
+machines.
+
     from rog2_pf import lik_pf_batch, run_beam_ensemble_batch
     results = lik_pf_batch([(hw, tw) for hw, tw in wells])
     out, ev_index, quality = results[0]
@@ -305,6 +317,11 @@ def beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs=10, mc=20.0, es=144.0, r=2, **k
 
     Signature and defaults match the original. Returns the tracked TVT for every
     row of ``hgr``.
+
+    One difference: the type-well log is sorted here rather than assumed sorted.
+    The kernel locates the starting sample with a binary search, so an unsorted
+    ``tw_tvt`` would silently give a wrong answer; the notebook's callers all
+    pass ``tw.sort_values('TVT')`` anyway, so this is a no-op for them.
     """
     hgr = np.asarray(hgr, dtype=np.float32)
     if len(hgr) == 0:

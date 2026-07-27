@@ -8,12 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       features:
-        description: 'Comma-separated maturin feature flags (e.g. cpu, cuda, hip)'
+        description: 'Comma-separated maturin feature flags (e.g. cpu, cuda, wgpu, hip)'
         required: false
-        default: 'cpu'
+        default: 'cuda,wgpu,cpu'
         type: string
 
 env:
+  # Features always needed for the Python extension module.
   MATURIN_FEATURES: 'pyo3/extension-module,python'
 
 jobs:
@@ -32,11 +33,64 @@ jobs:
             -o dist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-${{ inputs.features || 'cpu' }}
+          path: dist/*.whl
+
+  # Full-featured wheel with all backends for the official PyPI release.
+  build-all:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheel (CUDA + wgpu + CPU)
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: latest
+          command: build
+          args: >
+            --release --no-default-features
+            --features 'pyo3/extension-module,python,cuda,wgpu,cpu'
+            -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-all
+          path: dist/*.whl
+
+  # ROCm/HIP wheel — built in a standard runner with ROCm SDK headers installed.
+  # Compilation succeeds without an AMD GPU; the wheel is architecture-neutral.
+  build-hip:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ROCm HIP headers
+        run: |
+          # rocm-dev includes hip-compiler and hip-common headers needed by cubecl/hip.
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
+          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest ubuntu main' | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rocm-dev hip-compiler hip-common 2>&1 | tail -5
+          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "/opt/rocm/llvm/bin" >> "$GITHUB_PATH"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build wheel (HIP/ROCm)
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: latest
+          command: build
+          args: >
+            --release --no-default-features
+            --features 'pyo3/extension-module,python,hip'
+            -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-hip
           path: dist/*.whl
 
   publish:
-    needs: [build]
+    needs: [build, build-all, build-hip]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi
@@ -45,12 +99,20 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: dist-${{ inputs.features || 'cpu' }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-all
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-hip
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   test-pypi-publish:
-    needs: [build]
+    needs: [build, build-all, build-hip]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: test-pypi
@@ -59,7 +121,15 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: dist-${{ inputs.features || 'cpu' }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-all
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-hip
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
