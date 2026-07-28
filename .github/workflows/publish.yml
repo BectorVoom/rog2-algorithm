@@ -66,8 +66,12 @@ jobs:
       - name: Install ROCm HIP headers
         run: |
           # rocm-dev includes hip-compiler and hip-common headers needed by cubecl/hip.
+          # The repo publishes per-codename dists (jammy, noble, ...), not a
+          # literal "ubuntu" — detect the runner's actual codename so this
+          # survives runner image upgrades (ubuntu-latest moved 22.04 -> 24.04
+          # underneath this workflow without any change here).
           curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
-          echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest ubuntu main' | sudo tee /etc/apt/sources.list.d/rocm.list
+          echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/latest $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/rocm.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq rocm-dev hip-compiler hip-common 2>&1 | tail -5
           echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
