@@ -279,6 +279,11 @@ def run_beam_ensemble_batch(pairs, configs=None, backend="auto", cube_dim=64, **
 
     Batching is the whole point: 14 configs x N wells become one grid, so a T4
     stays saturated instead of running one config at a time in Python.
+
+    Pass ``smoothing="savitzky_golay"`` to use a curvature-preserving quadratic
+    fit instead of the notebook-matching default (``"rolling_mean"``, a plain
+    centred moving average) for the GR smoothing pass — a configurable
+    alternative for testing whether it tracks better in practice.
     """
     prepared, indices, outs = [], [], []
     for hw, tw in pairs:

@@ -235,6 +235,13 @@ fn parse_beam_configs(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<BeamConfig
 /// ensemble mean over configs), `kept` (indices of the input wells that had a
 /// non-empty evaluation zone) and, when `with_per_config` is set, `per_config`
 /// (`[config][well]` arrays).
+///
+/// `smoothing` selects the GR-smoothing algorithm applied before the search:
+/// `"rolling_mean"` (default) matches the notebook's actually-active `_smooth`
+/// (see `beam_kernel`'s module doc); `"savitzky_golay"` is a configurable
+/// alternative — a smoother that fits local curvature rather than averaging
+/// flat, offered to test whether it tracks better in practice despite not
+/// matching the notebook.
 #[pyfunction]
 #[pyo3(signature = (
     wells,
@@ -243,7 +250,9 @@ fn parse_beam_configs(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<BeamConfig
     backend = "auto",
     with_per_config = false,
     budget_mb = 512,
+    smoothing = "rolling_mean",
 ))]
+#[allow(clippy::too_many_arguments)]
 fn run_beam_batch<'py>(
     py: Python<'py>,
     wells: &Bound<'py, PyList>,
@@ -252,6 +261,7 @@ fn run_beam_batch<'py>(
     backend: &str,
     with_per_config: bool,
     budget_mb: usize,
+    smoothing: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed: Vec<BeamWellInput> = wells
         .iter()
@@ -263,6 +273,7 @@ fn run_beam_batch<'py>(
         cube_dim,
         with_per_config,
         budget_bytes: budget_mb << 20,
+        smoothing: smoothing.parse().map_err(err)?,
     };
 
     // The kernel does not touch Python state, so other threads can run.

@@ -115,3 +115,44 @@ fn beam_backtrack_matches_reference_on_hip() {
     }
     assert_eq!(gpu.mean, cpu.mean);
 }
+
+/// The configurable Savitzky-Golay smoothing alternative (`BeamOptions::smoothing`)
+/// on the kernel side, against the same alternative in the scalar reference —
+/// same real-hardware rationale as `beam_backtrack_matches_reference_on_hip`.
+#[cfg(feature = "hip")]
+#[test]
+fn beam_savgol_smoothing_matches_reference_on_hip() {
+    use rog2_pf::beam::{BeamConfig, BeamOptions, SmoothingKind};
+    use rog2_pf::beam_reference::run_beam_reference;
+    use rog2_pf::run_beam_on;
+    use rog2_pf::synthetic::synthetic_beam_well;
+
+    const CONFIGS: [BeamConfig; 3] = [
+        BeamConfig::new(4, 20.0, 144.0, 2),
+        BeamConfig::new(6, 8.0, 64.0, 0),
+        BeamConfig::new(5, 12.0, 100.0, 3),
+    ];
+    let o = BeamOptions {
+        cube_dim: 16,
+        with_per_config: true,
+        smoothing: SmoothingKind::SavitzkyGolay,
+        ..BeamOptions::default()
+    };
+    let wells: Vec<_> = (0..2)
+        .map(|s| synthetic_beam_well(s + 1, 40 + 10 * s as usize).0)
+        .collect();
+
+    let gpu = run_beam_on(Backend::Hip, &wells, &CONFIGS, &o).expect("hip run");
+    let cpu = run_beam_reference(&wells, &CONFIGS, &o).expect("reference run");
+
+    assert_eq!(gpu.ev_lens, cpu.ev_lens);
+    assert_eq!(gpu.kept, cpu.kept);
+    for c in 0..CONFIGS.len() {
+        assert_eq!(
+            gpu.config_rows(c).unwrap(),
+            cpu.config_rows(c).unwrap(),
+            "config {c} trajectory differs"
+        );
+    }
+    assert_eq!(gpu.mean, cpu.mean);
+}

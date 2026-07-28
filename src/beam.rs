@@ -63,6 +63,34 @@ pub const NOTEBOOK_BEAM_CONFIGS: [BeamConfig; 14] = [
     BeamConfig::new(10, 50.0, 400.0, 0),
 ];
 
+/// Which GR-smoothing algorithm the search's `sg` planes use.
+///
+/// `RollingMean` reproduces the notebook's actually-active `_smooth` (cell 37's
+/// `pd.Series(vals).rolling(2*r+1, center=True, min_periods=1).mean()` — see
+/// `beam_kernel`'s module doc for why this, and not Savitzky-Golay, is the
+/// reference). `SavitzkyGolay` is offered as a configurable alternative to
+/// test whether a smoother that preserves local curvature (rather than a flat
+/// average) tracks better in practice, despite not matching the notebook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SmoothingKind {
+    #[default]
+    RollingMean,
+    SavitzkyGolay,
+}
+
+impl std::str::FromStr for SmoothingKind {
+    type Err = crate::PfError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "rolling_mean" | "rolling-mean" | "mean" => Ok(Self::RollingMean),
+            "savitzky_golay" | "savitzky-golay" | "savgol" | "sg" => Ok(Self::SavitzkyGolay),
+            other => Err(crate::PfError::Config(format!(
+                "unknown smoothing kind '{other}': expected 'rolling_mean' or 'savitzky_golay'"
+            ))),
+        }
+    }
+}
+
 /// Launch-shape and output options.
 #[derive(Debug, Clone, Copy)]
 pub struct BeamOptions {
@@ -75,6 +103,9 @@ pub struct BeamOptions {
     /// Device bytes to spend on the `[n_configs, rows]` trajectory buffer before
     /// splitting the batch into chunks.
     pub budget_bytes: usize,
+    /// GR-smoothing algorithm, applied uniformly to every config's smoothing
+    /// pass in this batch. Defaults to matching the notebook.
+    pub smoothing: SmoothingKind,
 }
 
 impl Default for BeamOptions {
@@ -83,6 +114,7 @@ impl Default for BeamOptions {
             cube_dim: 64,
             with_per_config: false,
             budget_bytes: 512 << 20,
+            smoothing: SmoothingKind::RollingMean,
         }
     }
 }

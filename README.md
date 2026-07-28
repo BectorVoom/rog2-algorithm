@@ -90,6 +90,7 @@ rows filled with the 14-config ensemble mean).
 | `configs` | `list[tuple] \| None` | `None` | Override `BEAM_CONFIGS`; each tuple is `(beam_size, move_cost, err_scale, radius)` |
 | `backend` | `str` | `"auto"` | Same backends as particle filter |
 | `cube_dim` | `int` | `64` | Threads per block |
+| `smoothing` | `str` | `"rolling_mean"` | GR-smoothing algorithm: `"rolling_mean"` matches the notebook's actually-active `_smooth` (a plain centred moving average); `"savitzky_golay"` is a configurable alternative (quadratic curve fit) offered for experimentation. Measured on 155 real wells: pooled RMSE against true hidden-section TVT is within 0.006 ft either way (14.857 vs 14.863 ft) — not a meaningful accuracy difference, so `"rolling_mean"` (notebook fidelity) remains the default. |
 
 Wells with no evaluation rows return a copy of their input `TVT_input` column.
 

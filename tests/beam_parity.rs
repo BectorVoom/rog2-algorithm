@@ -5,7 +5,7 @@
 //! Real-scale verification against the notebook's numpy `beam_search` happens on
 //! Kaggle (see `kaggle/rog2-beam-cubecl-t4.ipynb`).
 
-use rog2_pf::beam::{BeamConfig, BeamOptions, max_beam_capacity, smoothing_planes};
+use rog2_pf::beam::{BeamConfig, BeamOptions, SmoothingKind, max_beam_capacity, smoothing_planes};
 use rog2_pf::beam_reference::{beam_search_one, run_beam_reference, sg_smooth};
 use rog2_pf::synthetic::{rmse64, synthetic_beam_well};
 use rog2_pf::{Backend, run_beam_on};
@@ -166,13 +166,16 @@ fn beam_beats_the_last_known_baseline() {
 // GR smoothing (centred rolling mean)
 // ---------------------------------------------------------------------------
 
-/// `radius = 0` is `_smooth`'s own `if r > 0 else s` branch: the identity.
+/// `radius = 0` is `_smooth`'s own `if r > 0 else s` branch: the identity, for
+/// either smoothing kind.
 #[test]
 fn sg_smooth_radius_zero_is_the_identity() {
     let gr = vec![5.0f64, 9.0, 2.0, 7.0, 1.0];
-    let mut out = vec![0.0f64; gr.len()];
-    sg_smooth(&gr, 0, &mut out);
-    assert_eq!(out, gr);
+    for kind in [SmoothingKind::RollingMean, SmoothingKind::SavitzkyGolay] {
+        let mut out = vec![0.0f64; gr.len()];
+        sg_smooth(&gr, 0, &mut out, kind);
+        assert_eq!(out, gr, "{kind:?}");
+    }
 }
 
 /// Hand-computed against `pd.Series(gr).rolling(2*r+1, center=True,
@@ -182,7 +185,7 @@ fn sg_smooth_radius_zero_is_the_identity() {
 fn sg_smooth_matches_pandas_rolling_mean_by_hand() {
     let gr: Vec<f64> = (0..10).map(|i| i as f64).collect();
     let mut out = vec![0.0f64; gr.len()];
-    sg_smooth(&gr, 2, &mut out);
+    sg_smooth(&gr, 2, &mut out, SmoothingKind::RollingMean);
     let expect = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 7.5, 8.0];
     for (i, (a, b)) in out.iter().zip(&expect).enumerate() {
         assert!((a - b).abs() < 1e-9, "row {i}: {a} vs {b}");
@@ -190,22 +193,34 @@ fn sg_smooth_matches_pandas_rolling_mean_by_hand() {
 }
 
 /// Away from either edge the window is always full (`2r+1` points), so the mean
-/// of a linear ramp reproduces the ramp exactly — the odd moments cancel.
+/// of a linear ramp reproduces the ramp exactly — the odd moments cancel. Holds
+/// for the Savitzky-Golay fit too (a quadratic fit reproduces a linear signal
+/// exactly, everywhere including the edges).
 #[test]
-fn sg_smooth_interior_reproduces_a_linear_ramp() {
+fn sg_smooth_reproduces_a_linear_ramp() {
     let n = 40;
     let f = |i: usize| 3.0 - 0.5 * i as f64;
     let gr: Vec<f64> = (0..n).map(f).collect();
 
     for r in 1..=5u32 {
-        let mut out = vec![0.0f64; n];
-        sg_smooth(&gr, r, &mut out);
+        let mut rolling = vec![0.0f64; n];
+        sg_smooth(&gr, r, &mut rolling, SmoothingKind::RollingMean);
         let m = r as usize;
         for i in m..n - m {
             assert!(
-                (out[i] - f(i)).abs() < 1e-9,
-                "radius {r} row {i}: {} vs exact {}",
-                out[i],
+                (rolling[i] - f(i)).abs() < 1e-9,
+                "rolling mean radius {r} row {i}: {} vs exact {}",
+                rolling[i],
+                f(i)
+            );
+        }
+
+        let mut savgol = vec![0.0f64; n];
+        sg_smooth(&gr, r, &mut savgol, SmoothingKind::SavitzkyGolay);
+        for (i, v) in savgol.iter().enumerate() {
+            assert!(
+                (v - f(i)).abs() < 1e-9,
+                "savgol radius {r} row {i}: {v} vs exact {}",
                 f(i)
             );
         }
@@ -213,15 +228,55 @@ fn sg_smooth_interior_reproduces_a_linear_ramp() {
 }
 
 /// `min_periods=1` semantics: a window wider than the series still produces a
-/// plain mean over the whole thing, not a NaN or a panic.
+/// plain mean over the whole thing, not a NaN or a panic. Savitzky-Golay has
+/// its own too-short-series guard (`n <= max(3, 2r+1)`, matching the original
+/// notebook cell), which passes the series through unchanged instead.
 #[test]
 fn sg_smooth_handles_a_series_shorter_than_the_window() {
     let gr = vec![5.0f64, 9.0, 2.0];
-    let mut out = vec![0.0f64; gr.len()];
-    sg_smooth(&gr, 4, &mut out);
+    let mut rolling = vec![0.0f64; gr.len()];
+    sg_smooth(&gr, 4, &mut rolling, SmoothingKind::RollingMean);
     let expect_mean = (5.0 + 9.0 + 2.0) / 3.0;
-    for v in &out {
+    for v in &rolling {
         assert!((v - expect_mean).abs() < 1e-9);
+    }
+
+    let mut savgol = vec![0.0f64; gr.len()];
+    sg_smooth(&gr, 4, &mut savgol, SmoothingKind::SavitzkyGolay);
+    assert_eq!(savgol, gr);
+}
+
+/// In the interior the Savitzky-Golay fit must equal the textbook quadratic
+/// convolution — for a 5-point window, `[-3, 12, 17, 12, -3] / 35`.
+#[test]
+fn sg_smooth_savgol_matches_the_textbook_five_point_kernel() {
+    let gr: Vec<f64> = (0..30).map(|i| ((i * 37) % 23) as f64).collect();
+    let mut out = vec![0.0f64; gr.len()];
+    sg_smooth(&gr, 2, &mut out, SmoothingKind::SavitzkyGolay);
+
+    let coef = [-3.0, 12.0, 17.0, 12.0, -3.0];
+    for i in 2..gr.len() - 2 {
+        let expect: f64 = (0..5).map(|j| coef[j] * gr[i - 2 + j]).sum::<f64>() / 35.0;
+        assert!(
+            (out[i] - expect).abs() < 1e-9,
+            "row {i}: {} vs {expect}",
+            out[i]
+        );
+    }
+}
+
+/// A quadratic through three points is interpolation, not regression, so
+/// `radius = 1` is the identity for the Savitzky-Golay fit — as it is in
+/// scipy. Two of the notebook's 14 configs specify it (though they run
+/// through the rolling-mean default, where radius 1 is a 3-point average, not
+/// the identity).
+#[test]
+fn sg_smooth_savgol_radius_one_is_the_identity() {
+    let gr: Vec<f64> = (0..20).map(|i| ((i * 41) % 17) as f64).collect();
+    let mut out = vec![0.0f64; gr.len()];
+    sg_smooth(&gr, 1, &mut out, SmoothingKind::SavitzkyGolay);
+    for (a, b) in out.iter().zip(&gr) {
+        assert!((a - b).abs() < 1e-9, "{a} vs {b}");
     }
 }
 

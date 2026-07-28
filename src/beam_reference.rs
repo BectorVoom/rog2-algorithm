@@ -10,7 +10,8 @@
 //! deviations.
 
 use crate::beam::{
-    BeamConfig, BeamOptions, BeamOutput, BeamWellInput, FlatBeamBatch, smoothing_planes,
+    BeamConfig, BeamOptions, BeamOutput, BeamWellInput, FlatBeamBatch, SmoothingKind,
+    smoothing_planes,
 };
 use crate::PfError;
 
@@ -20,10 +21,17 @@ use crate::PfError;
 const BEAM_INF: f64 = 1e30;
 const BEAM_DEAD: f64 = 5e29;
 
-/// Centred rolling-mean smoothing of one well's GR, matching
-/// [`crate::beam_kernel::sg_smooth_kernel`] (which see for why this is a plain
-/// moving average and not a Savitzky-Golay fit).
-pub fn sg_smooth(gr: &[f64], radius: u32, out: &mut [f64]) {
+/// GR smoothing of one well, matching [`crate::beam_kernel::sg_smooth_kernel`]
+/// (which see for both algorithms and why `RollingMean`, not `SavitzkyGolay`,
+/// is the notebook-matching default).
+pub fn sg_smooth(gr: &[f64], radius: u32, out: &mut [f64], kind: SmoothingKind) {
+    match kind {
+        SmoothingKind::RollingMean => sg_smooth_rolling_mean(gr, radius, out),
+        SmoothingKind::SavitzkyGolay => sg_smooth_savgol(gr, radius, out),
+    }
+}
+
+fn sg_smooth_rolling_mean(gr: &[f64], radius: u32, out: &mut [f64]) {
     let n = gr.len();
     let m = radius as usize;
     if m == 0 {
@@ -35,6 +43,48 @@ pub fn sg_smooth(gr: &[f64], radius: u32, out: &mut [f64]) {
         let hi = (i + m + 1).min(n);
         let acc: f64 = gr[lo..hi].iter().sum();
         *o = acc / (hi - lo) as f64;
+    }
+}
+
+/// Quadratic Savitzky-Golay smoothing, offered as a configurable alternative
+/// to the notebook's rolling mean (see `sg_smooth_kernel`'s doc comment).
+fn sg_smooth_savgol(gr: &[f64], radius: u32, out: &mut [f64]) {
+    let n = gr.len();
+    let m = radius as usize;
+    if m == 0 || n <= 3 || n <= 2 * m + 1 {
+        out.copy_from_slice(gr);
+        return;
+    }
+    let w = 2 * m + 1;
+
+    for (i, o) in out.iter_mut().enumerate() {
+        let s = if i < m {
+            0
+        } else if i + m >= n {
+            n - w
+        } else {
+            i - m
+        };
+        let xe = i as f64 - s as f64 - m as f64;
+
+        let (mut s0, mut s2, mut s4) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut t0, mut t1, mut t2) = (0.0f64, 0.0f64, 0.0f64);
+        for j in 0..w {
+            let x = j as f64 - m as f64;
+            let x2 = x * x;
+            let y = gr[s + j];
+            s0 += 1.0;
+            s2 += x2;
+            s4 += x2 * x2;
+            t0 += y;
+            t1 += x * y;
+            t2 += x2 * y;
+        }
+        let det = s0 * s4 - s2 * s2;
+        let a0 = (t0 * s4 - t2 * s2) / det;
+        let a1 = t1 / s2;
+        let a2 = (t2 * s0 - t0 * s2) / det;
+        *o = a0 + a1 * xe + a2 * xe * xe;
     }
 }
 
@@ -238,7 +288,7 @@ pub fn run_beam_reference(
             .iter()
             .map(|r| {
                 let mut s = vec![0.0f64; ev_len];
-                sg_smooth(gr, *r, &mut s);
+                sg_smooth(gr, *r, &mut s, opts.smoothing);
                 s
             })
             .collect();

@@ -94,6 +94,16 @@ const BEAM_DEAD: f32 = 5e29;
 ///
 /// `radii[k]` is the half-window of output plane `k`; `0` copies the input,
 /// matching `_smooth`'s own `if r > 0 else s` branch.
+///
+/// `use_savgol` is a compile-time switch to the alternative, *not*
+/// notebook-matching Savitzky-Golay fit (quadratic least-squares through the
+/// centred window, evaluated at its centre — or off-centre for the `r` edge
+/// rows, matching scipy's `mode='interp'`) — a configurable option for testing
+/// whether a curvature-preserving smoother tracks better in practice than the
+/// notebook's flat rolling mean. `#[comptime]` because it is a per-launch
+/// setting (`BeamOptions::smoothing`, uniform across the whole batch), not a
+/// per-thread decision, so branching on it at compile time costs nothing at
+/// runtime.
 #[cube(launch, launch_unchecked)]
 pub fn sg_smooth_kernel<F: Float + CubeElement>(
     gr: &Array<F>,
@@ -103,6 +113,7 @@ pub fn sg_smooth_kernel<F: Float + CubeElement>(
     out: &mut Array<F>,
     total_rows: u32,
     n_planes: u32,
+    #[comptime] use_savgol: bool,
 ) {
     let idx = ABSOLUTE_POS;
     let rows = total_rows as usize;
@@ -120,7 +131,46 @@ pub fn sg_smooth_kernel<F: Float + CubeElement>(
         let m = radii[k] as usize;
         let mut v = gr[ev_off + i];
 
-        if m > 0 {
+        if use_savgol {
+            if m > 0 && ev_len > 3 && ev_len > 2 * m + 1 {
+                let w = 2 * m + 1;
+
+                let mut s = 0usize;
+                if i + m >= ev_len {
+                    s = ev_len - w;
+                } else if i >= m {
+                    s = i - m;
+                }
+                let xe = F::cast_from(i) - F::cast_from(s) - F::cast_from(m);
+
+                let mut s0 = F::new(0.0f32);
+                let mut s2 = F::new(0.0f32);
+                let mut s4 = F::new(0.0f32);
+                let mut t0 = F::new(0.0f32);
+                let mut t1 = F::new(0.0f32);
+                let mut t2 = F::new(0.0f32);
+
+                let mut j = 0usize;
+                while j < w {
+                    let x = F::cast_from(j) - F::cast_from(m);
+                    let x2 = x * x;
+                    let y = gr[ev_off + s + j];
+                    s0 += F::new(1.0f32);
+                    s2 += x2;
+                    s4 += x2 * x2;
+                    t0 += y;
+                    t1 += x * y;
+                    t2 += x2 * y;
+                    j += 1;
+                }
+
+                let det = s0 * s4 - s2 * s2;
+                let a0 = (t0 * s4 - t2 * s2) / det;
+                let a1 = t1 / s2;
+                let a2 = (t2 * s0 - t0 * s2) / det;
+                v = a0 + a1 * xe + a2 * xe * xe;
+            }
+        } else if m > 0 {
             let mut lo = 0usize;
             if i >= m {
                 lo = i - m;

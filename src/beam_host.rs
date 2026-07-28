@@ -6,8 +6,8 @@ use cubecl::prelude::*;
 use cubek_std::cube_count::cube_count_spread_with_total;
 
 use crate::beam::{
-    BeamConfig, BeamOptions, BeamOutput, BeamWellInput, FlatBeamBatch, max_beam_capacity,
-    smoothing_planes,
+    BeamConfig, BeamOptions, BeamOutput, BeamWellInput, FlatBeamBatch, SmoothingKind,
+    max_beam_capacity, smoothing_planes,
 };
 use crate::beam_kernel::{beam_mean_kernel, beam_search_kernel, sg_smooth_kernel};
 use crate::PfError;
@@ -186,6 +186,7 @@ pub fn run_beam<R: Runtime>(
                 ArrayArg::from_raw_parts(h_sgr.clone(), n_planes * sub_rows),
                 sub_rows as u32,
                 n_planes as u32,
+                opts.smoothing == SmoothingKind::SavitzkyGolay,
             );
         }
 
