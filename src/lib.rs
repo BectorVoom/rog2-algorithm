@@ -199,6 +199,19 @@ macro_rules! on_backend {
 }
 
 /// Tries every compiled-in backend in `Auto` preference order (HIP → CUDA → wgpu → CPU).
+///
+/// Client creation isn't panic-safe in every runtime we depend on: cudarc
+/// panics rather than returning `Err` when `libcuda.so` can't be dlopen'd, and
+/// that failure kills the background device-stream-dispatch thread CubeCL
+/// spawns to talk to it, which in turn poisons a channel recv on *this*
+/// thread and panics again with `RecvError` — so `Backend::Auto` used to abort
+/// the whole process on a machine without an NVIDIA driver instead of falling
+/// through to wgpu/CPU. Both panics happen synchronously inside the call this
+/// macro makes, so wrapping it in `catch_unwind` is enough to recover: the
+/// second panic (the one visible to the calling thread) is what `catch_unwind`
+/// observes, and we treat it as "this backend didn't come up" and move on.
+/// The default panic hook is silenced for the duration so an expected,
+/// recovered probe failure doesn't print a stack trace.
 macro_rules! first_working_backend {
     ($run:expr) => {{
         let candidates = available_backends();
@@ -207,13 +220,27 @@ macro_rules! first_working_backend {
                 "compile with one of the `hip`, `cuda`, `wgpu` or `cpu` features".into(),
             ));
         }
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         let mut last = None;
         for b in candidates {
-            match $run(b) {
-                Ok(out) => return Ok(out),
-                Err(e) => last = Some(e),
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $run(b))) {
+                Ok(Ok(out)) => {
+                    std::panic::set_hook(prev_hook);
+                    return Ok(out);
+                }
+                Ok(Err(e)) => last = Some(e),
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panicked while initialising".to_string());
+                    last = Some(PfError::Device(format!("{b:?} backend unavailable: {msg}")));
+                }
             }
         }
+        std::panic::set_hook(prev_hook);
         Err(last.unwrap())
     }};
 }

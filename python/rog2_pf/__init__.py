@@ -11,7 +11,11 @@ The native entry points are :func:`run_batch` and :func:`run_beam_batch`, which
 take *all* wells at once so one launch fills the GPU. :func:`lik_pf`,
 :func:`lik_pf_batch`, :func:`run_beam_ensemble` and
 :func:`run_beam_ensemble_batch` are drop-in replacements for the notebook's
-helpers and take the same pandas frames.
+helpers and take the same pandas frames. :func:`run_particle_filter` and
+:func:`run_pf_lik_ensemble_scales` are name-compatible aliases for the
+notebook's *own* pure-Python functions of the same name — same call
+signature, same return contract — for call sites that want to swap the
+notebook's estimator for this GPU one without renaming anything.
 
 Backends are selected via the ``backend`` parameter (``"cuda"``, ``"wgpu"``,
 ``"hip"`` / ``"rocm"``, ``"cpu"``, or ``"auto"``). The shipped wheel bundles
@@ -56,6 +60,8 @@ __all__ = [
     "prepare_beam_well",
     "lik_pf",
     "lik_pf_batch",
+    "run_particle_filter",
+    "run_pf_lik_ensemble_scales",
     "beam_search",
     "run_beam_ensemble",
     "run_beam_ensemble_batch",
@@ -228,6 +234,81 @@ def lik_pf(hw, tw, **kwargs):
     """
     seed_base = kwargs.pop("seed_base", 0)
     return lik_pf_batch([(hw, tw)], seed_bases=[seed_base], **kwargs)[0]
+
+
+def run_particle_filter(hw, tw, n_particles=500, seed=42, backend="auto", **kwargs):
+    """Name-compatible drop-in for the notebook's own ``run_particle_filter``.
+
+    The notebook version runs one seed's raw particle path in pure Python.
+    This wraps :func:`lik_pf_batch` with ``n_seeds=1``: the GPU kernel doesn't
+    expose each seed's trajectory separately, only the seed-ensembled
+    channels, but with a single seed the softmax ensemble over one element is
+    the identity, so ``pf_mean`` *is* that seed's own path. Returns
+    ``(pred, log_lik)`` laid out like the notebook's version: known rows keep
+    their input TVT, evaluation rows carry the tracked path.
+
+    Prefer :func:`run_pf_lik_ensemble_scales` (or :func:`lik_pf_batch`
+    directly): a single seed cannot fill a GPU, so this call exists for
+    notebook-compatible call sites and one-off/debug use, not throughput.
+    """
+    out_vals = hw["TVT_input"].values.astype(float).copy()
+    ev_index = hw.index[hw["TVT_input"].isna()].values
+    if len(ev_index) == 0:
+        return out_vals, 0.0
+
+    out, idx, quality = lik_pf_batch(
+        [(hw, tw)],
+        n_particles=n_particles,
+        n_seeds=1,
+        seed_bases=[int(seed)],
+        backend=backend,
+        with_quality=True,
+        **kwargs,
+    )[0]
+    out_vals[idx] = out["pf_mean"]
+    log_lik = quality["pf_best_ll"] * len(idx)
+    return out_vals, float(log_lik)
+
+
+def run_pf_lik_ensemble_scales(
+    hw, tw, scales=DEFAULT_SCALES, n_particles=500, n_seeds=128, backend="auto", **kwargs
+):
+    """Name-compatible drop-in for the notebook's own ``run_pf_lik_ensemble_scales``.
+
+    Wraps :func:`lik_pf_batch`: returns one full-row array per requested scale
+    (keyed ``f"pf_scale_{s:g}"``) plus ``"pf_mean"``, with known rows preserved
+    from ``hw["TVT_input"]`` and evaluation rows carrying the seed-ensemble
+    estimate — the same contract as the notebook function.
+
+    The notebook's ``branch_stats`` argument feeds its selector-side bimodal
+    hedge, which is analysis built on top of the raw per-seed paths; the GPU
+    kernel doesn't expose those paths (only the ensembled channels and, via
+    ``with_quality=True`` on :func:`lik_pf_batch`, a per-well quality scalar),
+    so it has no equivalent here and is not accepted.
+
+    Prefer calling :func:`lik_pf_batch` directly across all your wells at once
+    — one well's seed ensemble cannot fill a GPU either.
+    """
+    base = hw["TVT_input"].values.astype(float)
+    ev_index = hw.index[hw["TVT_input"].isna()].values
+    scale_keys = [f"pf_scale_{s:g}" for s in scales]
+    if len(ev_index) == 0:
+        return {k: base.copy() for k in (*scale_keys, "pf_mean")}
+
+    out, idx, _ = lik_pf_batch(
+        [(hw, tw)],
+        n_particles=n_particles,
+        n_seeds=n_seeds,
+        scales=tuple(float(s) for s in scales),
+        backend=backend,
+        **kwargs,
+    )[0]
+    result = {}
+    for k in (*scale_keys, "pf_mean"):
+        arr = base.copy()
+        arr[idx] = out[k]
+        result[k] = arr
+    return result
 
 
 # ---------------------------------------------------------------------------

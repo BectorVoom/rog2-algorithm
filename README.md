@@ -76,6 +76,34 @@ Wells with no evaluation rows return `({}, empty_index, {})`.
 
 Single-well convenience. Prefer the batched form.
 
+#### `run_particle_filter(hw, tw, n_particles=500, seed=42, backend="auto", **kwargs)`
+
+Name-compatible alias for the notebook's own `run_particle_filter` — same
+signature, same `(pred, log_lik)` return, known rows preserved and evaluation
+rows filled in over the *full* `hw` length (not just the evaluation slice).
+
+`run_particle_filter` is inherently a compromise, not a true port. The GPU
+kernel doesn't expose one seed's raw trajectory — only the seed-ensembled
+channels. This gets around that by requesting `n_seeds=1` (softmax over one
+element is the identity, so `pf_mean` *is* that seed's path), and reconstructs
+`log_lik` by undoing the `pf_best_ll = liks.max() / n_rows` normalization.
+It's correct, but it's a single-seed GPU launch, which is a wasteful way to
+use this API. For real use, `run_pf_lik_ensemble_scales` / `lik_pf_batch` is
+the right call.
+
+#### `run_pf_lik_ensemble_scales(hw, tw, scales=(3.0, 5.0, 8.0, 12.0), n_particles=500, n_seeds=128, backend="auto", **kwargs)`
+
+Name-compatible alias for the notebook's own `run_pf_lik_ensemble_scales` —
+same signature, wraps `lik_pf_batch` for one well. Returns
+`dict[str, np.ndarray]` keyed `f"pf_scale_{s:g}"` per requested scale plus
+`"pf_mean"`, each a full-length array (known rows preserved, evaluation rows
+filled). The notebook's `branch_stats` argument has no equivalent: it feeds a
+bimodal-hedge diagnostic built on raw per-seed paths, which the GPU kernel
+doesn't expose (only the ensembled channels, and, via `lik_pf_batch(...,
+with_quality=True)`, a per-well quality scalar) — so it isn't accepted here.
+Prefer calling `lik_pf_batch` directly across every well at once; one well's
+seed ensemble can't fill a GPU either.
+
 ### Beam search
 
 #### `run_beam_ensemble_batch(pairs, ...)`
@@ -191,7 +219,9 @@ The beam search has no RNG and is bit-identical across runs, devices, and
 ## Backend selection
 
 The `backend` parameter accepts: `"cuda"`, `"wgpu"`, `"hip"` / `"rocm"`,
-`"cpu"`, or `"auto"` (tries compiled-in backends in preference order).
+`"cpu"`, or `"auto"` (tries compiled-in backends in preference order: HIP →
+CUDA → wgpu → CPU, falling through to the next candidate when one fails to
+initialise — e.g. no NVIDIA driver present for a wheel built with `cuda`).
 
 ```python
 from rog2_pf import lik_pf_batch, available_backends
