@@ -24,9 +24,9 @@ pub struct BeamConfig {
     /// Beam width `bs`: how many hypotheses survive each step.
     pub beam_size: u32,
     /// Per-move penalty `mc`; a move of `k` grid cells costs `mc * |k|`.
-    pub move_cost: f32,
+    pub move_cost: f64,
     /// GR mismatch scale `es`: the observation term is `(gr - tw_gr)^2 / es`.
-    pub err_scale: f32,
+    pub err_scale: f64,
     /// Savitzky-Golay half-window `r` applied to the horizontal GR. `0` disables
     /// smoothing.
     pub radius: u32,
@@ -34,7 +34,7 @@ pub struct BeamConfig {
 
 impl BeamConfig {
     /// Convenience constructor matching the notebook's tuple order.
-    pub const fn new(beam_size: u32, move_cost: f32, err_scale: f32, radius: u32) -> Self {
+    pub const fn new(beam_size: u32, move_cost: f64, err_scale: f64, radius: u32) -> Self {
         Self {
             beam_size,
             move_cost,
@@ -149,13 +149,13 @@ pub fn max_beam_capacity(configs: &[BeamConfig]) -> usize {
 #[derive(Debug, Clone)]
 pub struct BeamWellInput {
     /// Gamma ray of every evaluation row (already gap-filled), in MD order.
-    pub gr: Vec<f32>,
+    pub gr: Vec<f64>,
     /// Type-well TVT, **ascending** — the notebook's `tw.sort_values('TVT')`.
-    pub tw_tvt: Vec<f32>,
+    pub tw_tvt: Vec<f64>,
     /// Type-well GR, aligned with `tw_tvt`.
-    pub tw_gr: Vec<f32>,
+    pub tw_gr: Vec<f64>,
     /// `TVT_input` of the last known row: where the search starts.
-    pub last_tvt: f32,
+    pub last_tvt: f64,
 }
 
 impl BeamWellInput {
@@ -185,13 +185,13 @@ impl BeamWellInput {
 /// Flattened, device-ready view of a set of wells.
 #[derive(Debug, Clone, Default)]
 pub struct FlatBeamBatch {
-    pub gr: Vec<f32>,
-    pub tw_tvt: Vec<f32>,
-    pub tw_gr: Vec<f32>,
+    pub gr: Vec<f64>,
+    pub tw_tvt: Vec<f64>,
+    pub tw_gr: Vec<f64>,
     /// `BEAM_META_U_STRIDE` entries per well: `[ev_off, ev_len, tw_off, tw_len]`.
     pub meta_u: Vec<u32>,
     /// `BEAM_META_F_STRIDE` entries per well: `[last_tvt]`.
-    pub meta_f: Vec<f32>,
+    pub meta_f: Vec<f64>,
     /// Well index of every flattened evaluation row.
     pub row_well: Vec<u32>,
     /// Evaluation row count per well.
@@ -249,12 +249,14 @@ impl FlatBeamBatch {
         Ok((b, kept))
     }
 
-    /// Splits the batch into contiguous well ranges whose `[n_planes, rows]`
-    /// device buffers each stay under `budget_bytes`. A single well always gets
-    /// its own chunk even if it exceeds the budget on its own.
-    pub fn chunks(&self, n_planes: usize, budget_bytes: usize, elem_size: usize) -> Vec<(usize, usize)> {
-        let per_row = n_planes * elem_size;
-        let max_rows = (budget_bytes / per_row.max(1)).max(1);
+    /// Splits the batch into contiguous well ranges whose per-row device
+    /// buffers each stay under `budget_bytes`, given the caller's own
+    /// `per_row_bytes` (every buffer that scales with rows — `sgr`, `out`, and
+    /// the `max_beam`-wide history buffers alike — not just a single uniform
+    /// element size). A single well always gets its own chunk even if it
+    /// exceeds the budget on its own.
+    pub fn chunks(&self, per_row_bytes: usize, budget_bytes: usize) -> Vec<(usize, usize)> {
+        let max_rows = (budget_bytes / per_row_bytes.max(1)).max(1);
 
         let mut out = Vec::new();
         let mut start = 0usize;
@@ -302,10 +304,10 @@ pub fn smoothing_planes(configs: &[BeamConfig]) -> (Vec<u32>, Vec<u32>) {
 pub struct BeamOutput {
     /// Ensemble mean over configs, one value per evaluation row: the notebook's
     /// `beam_mean`.
-    pub mean: Vec<f32>,
+    pub mean: Vec<f64>,
     /// `[config][row]` trajectories, present only when
     /// [`BeamOptions::with_per_config`] was set.
-    pub per_config: Option<Vec<f32>>,
+    pub per_config: Option<Vec<f64>>,
     /// Start of each well's rows within a trajectory.
     pub ev_offsets: Vec<u32>,
     /// Evaluation row count per well.
@@ -322,7 +324,7 @@ impl BeamOutput {
     }
 
     /// One well's slice of the ensemble mean.
-    pub fn well_mean(&self, well: usize) -> Option<&[f32]> {
+    pub fn well_mean(&self, well: usize) -> Option<&[f64]> {
         let off = *self.ev_offsets.get(well)? as usize;
         let len = *self.ev_lens.get(well)? as usize;
         Some(&self.mean[off..off + len])
@@ -330,14 +332,14 @@ impl BeamOutput {
 
     /// All rows of one config's trajectory, or `None` if per-config output was
     /// not requested.
-    pub fn config_rows(&self, config: usize) -> Option<&[f32]> {
+    pub fn config_rows(&self, config: usize) -> Option<&[f64]> {
         let pc = self.per_config.as_ref()?;
         let n = self.total_rows();
         pc.get(config * n..(config + 1) * n)
     }
 
     /// One well's slice of one config's trajectory.
-    pub fn well_config(&self, config: usize, well: usize) -> Option<&[f32]> {
+    pub fn well_config(&self, config: usize, well: usize) -> Option<&[f64]> {
         let ch = self.config_rows(config)?;
         let off = *self.ev_offsets.get(well)? as usize;
         let len = *self.ev_lens.get(well)? as usize;

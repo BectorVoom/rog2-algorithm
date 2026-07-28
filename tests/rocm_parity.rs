@@ -70,3 +70,48 @@ fn hip_reruns_are_bit_identical() {
     assert_eq!(a.values, b.values, "output values differ between runs");
     assert_eq!(a.liks, b.liks, "log-likelihoods differ between runs");
 }
+
+/// The beam search's real target: the HIP kernel's Viterbi backtrack (every
+/// step scatters survivor + parent slot into a global-memory history buffer,
+/// then one unit per cube walks it backward from the cheapest final slot —
+/// see `beam_kernel`'s module doc) against the scalar reference, on the exact
+/// scenario `tests/beam_parity.rs::kernel_matches_reference_on_cpu_runtime`
+/// uses but can't check: CubeCL's CPU *interpreter* doesn't reconvene units
+/// correctly around that kernel's single-unit backtrack loop, so that test is
+/// ignored and this one is the real check.
+#[cfg(feature = "hip")]
+#[test]
+fn beam_backtrack_matches_reference_on_hip() {
+    use rog2_pf::beam::{BeamConfig, BeamOptions};
+    use rog2_pf::beam_reference::run_beam_reference;
+    use rog2_pf::run_beam_on;
+    use rog2_pf::synthetic::synthetic_beam_well;
+
+    const CONFIGS: [BeamConfig; 3] = [
+        BeamConfig::new(4, 20.0, 144.0, 2),
+        BeamConfig::new(6, 8.0, 64.0, 0),
+        BeamConfig::new(5, 12.0, 100.0, 3),
+    ];
+    let o = BeamOptions {
+        cube_dim: 16,
+        with_per_config: true,
+        ..BeamOptions::default()
+    };
+    let wells: Vec<_> = (0..2)
+        .map(|s| synthetic_beam_well(s + 1, 40 + 10 * s as usize).0)
+        .collect();
+
+    let gpu = run_beam_on(Backend::Hip, &wells, &CONFIGS, &o).expect("hip run");
+    let cpu = run_beam_reference(&wells, &CONFIGS, &o).expect("reference run");
+
+    assert_eq!(gpu.ev_lens, cpu.ev_lens);
+    assert_eq!(gpu.kept, cpu.kept);
+    for c in 0..CONFIGS.len() {
+        assert_eq!(
+            gpu.config_rows(c).unwrap(),
+            cpu.config_rows(c).unwrap(),
+            "config {c} trajectory differs"
+        );
+    }
+    assert_eq!(gpu.mean, cpu.mean);
+}

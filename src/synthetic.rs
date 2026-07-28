@@ -98,22 +98,22 @@ pub fn synthetic_well(seed: u32, n_rows: usize) -> (WellInput, Vec<f32>) {
 /// resampled grid, so the `(TVT, GR)` pairs are handed over as-is — with a little
 /// jitter on the TVT spacing, since the kernel must not assume a uniform axis.
 /// Returns the well and the true TVT path.
-pub fn synthetic_beam_well(seed: u32, n_rows: usize) -> (BeamWellInput, Vec<f32>) {
+pub fn synthetic_beam_well(seed: u32, n_rows: usize) -> (BeamWellInput, Vec<f64>) {
     let (w, truth) = synthetic_well(seed, n_rows);
-    let tw_tvt: Vec<f32> = (0..w.grid.len())
+    let tw_tvt: Vec<f64> = (0..w.grid.len())
         .map(|i| {
             // Stays strictly ascending: the jitter is well under one step.
-            w.vmin + i as f32 * w.step + 0.05 * w.step * (i as f32 * 0.7).sin()
+            (w.vmin + i as f32 * w.step + 0.05 * w.step * (i as f32 * 0.7).sin()) as f64
         })
         .collect();
 
     let well = BeamWellInput {
-        gr: w.gr,
+        gr: w.gr.iter().map(|&x| x as f64).collect(),
         tw_tvt,
-        tw_gr: w.grid,
-        last_tvt: truth[0],
+        tw_gr: w.grid.iter().map(|&x| x as f64).collect(),
+        last_tvt: truth[0] as f64,
     };
-    (well, truth)
+    (well, truth.iter().map(|&x| x as f64).collect())
 }
 
 /// Root-mean-square error between two equal-length series.
@@ -128,4 +128,11 @@ pub fn rmse(a: &[f32], b: &[f32]) -> f32 {
         })
         .sum();
     (s / a.len() as f64).sqrt() as f32
+}
+
+/// [`rmse`], for the beam search's f64 trajectories.
+pub fn rmse64(a: &[f64], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let s: f64 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    (s / a.len() as f64).sqrt()
 }

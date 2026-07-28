@@ -12,55 +12,34 @@
 use crate::beam::{
     BeamConfig, BeamOptions, BeamOutput, BeamWellInput, FlatBeamBatch, smoothing_planes,
 };
-use crate::beam_kernel::BEAM_INF;
 use crate::PfError;
 
-const BEAM_DEAD: f32 = 5e29;
+// Independent f64 copies of the kernel's sentinels (beam_kernel's BEAM_INF/
+// BEAM_DEAD stay f32 — they only ever feed CubeCL's `F::new()`, which requires
+// an f32 argument regardless of the instantiated float type).
+const BEAM_INF: f64 = 1e30;
+const BEAM_DEAD: f64 = 5e29;
 
-/// Quadratic Savitzky-Golay smoothing of one well's GR, matching
-/// [`crate::beam_kernel::sg_smooth_kernel`].
-pub fn sg_smooth(gr: &[f32], radius: u32, out: &mut [f32]) {
+/// Centred rolling-mean smoothing of one well's GR, matching
+/// [`crate::beam_kernel::sg_smooth_kernel`] (which see for why this is a plain
+/// moving average and not a Savitzky-Golay fit).
+pub fn sg_smooth(gr: &[f64], radius: u32, out: &mut [f64]) {
     let n = gr.len();
     let m = radius as usize;
-    if m == 0 || n <= 3 || n <= 2 * m + 1 {
+    if m == 0 {
         out.copy_from_slice(gr);
         return;
     }
-    let w = 2 * m + 1;
-
     for (i, o) in out.iter_mut().enumerate() {
-        let s = if i < m {
-            0
-        } else if i + m >= n {
-            n - w
-        } else {
-            i - m
-        };
-        let xe = i as f32 - s as f32 - m as f32;
-
-        let (mut s0, mut s2, mut s4) = (0.0f32, 0.0f32, 0.0f32);
-        let (mut t0, mut t1, mut t2) = (0.0f32, 0.0f32, 0.0f32);
-        for j in 0..w {
-            let x = j as f32 - m as f32;
-            let x2 = x * x;
-            let y = gr[s + j];
-            s0 += 1.0;
-            s2 += x2;
-            s4 += x2 * x2;
-            t0 += y;
-            t1 += x * y;
-            t2 += x2 * y;
-        }
-        let det = s0 * s4 - s2 * s2;
-        let a0 = (t0 * s4 - t2 * s2) / det;
-        let a1 = t1 / s2;
-        let a2 = (t2 * s0 - t0 * s2) / det;
-        *o = a0 + a1 * xe + a2 * xe * xe;
+        let lo = i.saturating_sub(m);
+        let hi = (i + m + 1).min(n);
+        let acc: f64 = gr[lo..hi].iter().sum();
+        *o = acc / (hi - lo) as f64;
     }
 }
 
 /// Index of the type-well sample nearest `v`, ties going to the lower index.
-fn nearest_index(tw: &[f32], v: f32) -> usize {
+fn nearest_index(tw: &[f64], v: f64) -> usize {
     let mut lo = 0usize;
     let mut hi = tw.len();
     while lo < hi {
@@ -93,27 +72,40 @@ fn nearest_index(tw: &[f32], v: f32) -> usize {
 
 /// One well, one config. `sgr` is the already-smoothed evaluation-row GR.
 pub fn beam_search_one(
-    sgr: &[f32],
-    tw_tvt: &[f32],
-    tw_gr: &[f32],
-    last_tvt: f32,
+    sgr: &[f64],
+    tw_tvt: &[f64],
+    tw_gr: &[f64],
+    last_tvt: f64,
     cfg: &BeamConfig,
-    out: &mut [f32],
+    out: &mut [f64],
 ) {
     let bs = cfg.beam_size as usize;
     let n_cand = bs * 5;
     let nt = tw_tvt.len();
+    let n = sgr.len();
 
     let si = nearest_index(tw_tvt, last_tvt);
     let mut b_idx = vec![si as u32; bs];
     let mut b_cost = vec![BEAM_INF; bs];
     b_cost[0] = 0.0;
 
+    // `_beam_jit` does not emit the per-step argmin: it keeps every step's
+    // survivor indices *and* which pre-step slot each descended from
+    // (`hI`/`hP`), then — only after the whole sequence has run — finds the
+    // single cheapest FINAL path and walks `hP` backward to recover it. A
+    // candidate that is not the cheapest at step `t` can still end up on the
+    // globally-best path, so emitting the step-wise argmin greedily (the
+    // previous version of this function) is a different algorithm, not just a
+    // different tie-break.
+    let mut hist_idx = vec![0u32; n * bs];
+    let mut hist_parent = vec![0u32; n * bs];
+
     let mut c_idx = vec![0u32; n_cand];
     let mut c_cost = vec![BEAM_INF; n_cand];
+    let mut c_parent = vec![0u32; n_cand];
     let mut c_dead = vec![true; n_cand];
 
-    for (step, o) in out.iter_mut().enumerate() {
+    for step in 0..n {
         let gv = sgr[step];
 
         for u in 0..n_cand {
@@ -136,9 +128,10 @@ pub fn beam_search_one(
             }
 
             c_idx[u] = ni as u32;
+            c_parent[u] = b as u32;
             c_cost[u] = if ok {
                 let d = gv - tw_gr[ni];
-                bc + d * d / cfg.err_scale + cfg.move_cost * (down + up) as f32
+                bc + d * d / cfg.err_scale + cfg.move_cost * (down + up) as f64
             } else {
                 BEAM_INF
             };
@@ -159,22 +152,24 @@ pub fn beam_search_one(
                 continue;
             }
             let (cu, iu) = (c_cost[u], c_idx[u]);
+            // Tie-break by candidate slot, not type-well index — see the
+            // matching comment in `beam_kernel::beam_search_kernel`.
             let rank = (0..n_cand)
                 .filter(|v| {
                     if c_dead[*v] {
                         return false;
                     }
                     let cv = c_cost[*v];
-                    cv < cu || (cv == cu && c_idx[*v] < iu)
+                    cv < cu || (cv == cu && *v < u)
                 })
                 .count();
             if rank < bs {
                 b_idx[rank] = iu;
                 b_cost[rank] = cu;
+                hist_idx[step * bs + rank] = iu;
+                hist_parent[step * bs + rank] = c_parent[u];
             }
         }
-
-        *o = tw_tvt[b_idx[0] as usize];
 
         let best = b_cost[0];
         for c in b_cost.iter_mut() {
@@ -182,6 +177,20 @@ pub fn beam_search_one(
                 *c -= best;
             }
         }
+    }
+
+    // ---- backtrack: find the cheapest final slot, then walk `hist_parent`
+    // backward, emitting each step's survivor on the way.
+    let mut best_slot = 0usize;
+    for s in 1..bs {
+        if b_cost[s] < b_cost[best_slot] {
+            best_slot = s;
+        }
+    }
+    let mut slot = best_slot;
+    for step in (0..n).rev() {
+        out[step] = tw_tvt[hist_idx[step * bs + slot] as usize];
+        slot = hist_parent[step * bs + slot] as usize;
     }
 }
 
@@ -225,10 +234,10 @@ pub fn run_beam_reference(
         let tw_gr = &batch.tw_gr[tw_off..tw_off + tw_len];
         let last = batch.meta_f[w];
 
-        let planes: Vec<Vec<f32>> = radii
+        let planes: Vec<Vec<f64>> = radii
             .iter()
             .map(|r| {
-                let mut s = vec![0.0f32; ev_len];
+                let mut s = vec![0.0f64; ev_len];
                 sg_smooth(gr, *r, &mut s);
                 s
             })
@@ -248,13 +257,13 @@ pub fn run_beam_reference(
     }
 
     for r in 0..total_rows {
-        let mut acc = 0.0f32;
+        let mut acc = 0.0f64;
         for c in 0..n_configs {
             acc += per_config[c * total_rows + r];
         }
         // Division, not multiplication by a reciprocal: the kernel divides, and
         // the parity test compares these bit-for-bit on small batches.
-        out.mean[r] = acc / n_configs as f32;
+        out.mean[r] = acc / n_configs as f64;
     }
 
     if !opts.with_per_config {

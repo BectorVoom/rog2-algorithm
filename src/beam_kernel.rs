@@ -1,8 +1,12 @@
 //! CubeCL implementation of the ROGII beam-search stratigraphic tracker.
 //!
 //! GPU port of `beam_search` / `run_beam_ensemble` from
-//! `notebook/rogii-another-approch-2nd.ipynb` (cell 12). The search walks a
-//! horizontal well's evaluation rows one at a time, keeping the `bs` cheapest
+//! `notebook/rogii-another-approch-2nd.ipynb` — specifically cell 37's numba
+//! `_beam_jit`/`_smooth`/`_nn`, which shadow cell 12's plain-Python versions of
+//! the same names and are what `run_beam_ensemble` actually resolves at call
+//! time (Python's late name binding; cell 12's versions never run once cell 37
+//! has executed). The search walks a horizontal well's evaluation rows one at a
+//! time, keeping the `bs` cheapest
 //! hypotheses about which type-well sample the current row sits on. Each step a
 //! hypothesis may move `-2..=2` grid cells, paying `mc * |move|` plus a GR
 //! mismatch term `(gr - tw_gr)^2 / es`.
@@ -30,11 +34,23 @@
 //!
 //! # Shared-memory budget
 //!
-//! Five allocations: the beam (`b_idx`, `b_cost`), the candidate list (`c_idx`,
-//! `c_cost`) and the dedup flags (`c_dead`). At the default `max_beam = 32` that
-//! is under 2.5 KB per cube, so occupancy is bounded by cubes-per-SM rather than
-//! by shared memory. It also stays inside the CubeCL CPU runtime's limit of eight
-//! shared allocations per kernel.
+//! Six allocations: the beam (`b_idx`, `b_cost`), the candidate list (`c_idx`,
+//! `c_cost`, `c_parent`) and the dedup flags (`c_dead`). At the default
+//! `max_beam = 32` that is under 3 KB per cube, so occupancy is bounded by
+//! cubes-per-SM rather than by shared memory. It also stays inside the CubeCL
+//! CPU runtime's limit of eight shared allocations per kernel.
+//!
+//! # Global-memory history buffer
+//!
+//! `_beam_jit` does not emit the per-step argmin — see the tie-breaking bullet
+//! below for why not — so this kernel cannot either. Instead every step scatters
+//! its survivors' indices and parent slots into `hist_idx`/`hist_parent`
+//! (`[n_configs, total_rows, max_beam]`, sized like `out` but `max_beam` wider),
+//! and only after the whole sequence has run does one unit per cube walk that
+//! history backward from the cheapest final slot to actually fill `out`. This
+//! is `max_beam` times larger than the shared-memory buffers above, so
+//! `run_beam`'s chunk sizing accounts for it explicitly rather than through the
+//! `elem_size` used for `sgr`/`out`.
 //!
 //! # Deliberate deviations from the notebook
 //!
@@ -43,11 +59,14 @@
 //!   longer resolve a single step's increment. After each step the cube subtracts
 //!   the best cost from the whole beam. Subtracting a constant from every path is
 //!   order-preserving, so the argmin and the surviving set are unchanged, and the
-//!   costs stay `O(1)`. numpy runs in f64 and does not need this.
-//! * **Tie-breaking.** `np.argsort`/`np.unique` leave the order of exactly equal
-//!   costs unspecified. Here dedup keeps the lowest candidate slot and ranking
-//!   breaks ties by type-well index, both of which are deterministic and
-//!   independent of the thread schedule.
+//!   costs stay `O(1)`. numpy runs in f64 and does not strictly need this, but it
+//!   is still order-preserving in f64, so there is no reason to remove it now
+//!   that this kernel is f64 too.
+//! * **Tie-breaking.** `_beam_jit` is a hand-rolled selection sort/dedup over an
+//!   array built in `(beam slot, move)` generation order, so on an exact cost
+//!   tie it deterministically keeps whichever candidate was recorded *first* in
+//!   that order. Both dedup and ranking here tie-break by candidate slot
+//!   `u = b*5 + m`, which enumerates in that same order, to match.
 
 use cubecl::prelude::*;
 
@@ -59,26 +78,22 @@ pub const BEAM_INF: f32 = 1e30;
 const BEAM_DEAD: f32 = 5e29;
 
 // ---------------------------------------------------------------------------
-// Savitzky-Golay smoothing
+// GR smoothing (centred rolling mean)
 // ---------------------------------------------------------------------------
 
-/// Quadratic Savitzky-Golay smoother, one output plane per distinct radius.
+/// Centred rolling-mean smoother, one output plane per distinct radius.
 ///
-/// Reproduces `savgol_filter(hgr, 2 * r + 1, 2)` with scipy's default
-/// `mode='interp'`: interior points are the least-squares quadratic through the
-/// centred window evaluated at its centre, and the `r` points at each end come
-/// from the single edge window's fit evaluated off-centre.
+/// Reproduces the notebook's *actually active* `_smooth` (cell 37 shadows cell
+/// 12's version, and it is cell 37's that `run_beam_ensemble` resolves at call
+/// time — see this module's doc comment):
+/// `pd.Series(vals).rolling(2*r+1, center=True, min_periods=1).mean()`. That is
+/// a plain centred moving average, not a Savitzky-Golay fit: `min_periods=1`
+/// means the edge rows just average whatever part of the window exists inside
+/// the series rather than fitting an edge polynomial, so the window is simply
+/// `[max(0, i-r), min(ev_len, i+r+1))`.
 ///
-/// Rather than convolving with tabulated coefficients inside and switching to a
-/// polynomial fit at the edges, this fits the quadratic directly in *centred*
-/// window coordinates and evaluates it at an offset. The two cases collapse into
-/// one code path (the interior is just offset zero), and centring kills the odd
-/// moments, so the 3x3 normal equations decouple into a 2x2 solve plus a
-/// division — well conditioned enough to stay in f32 where the uncentred
-/// Vandermonde system would not be.
-///
-/// `radii[k]` is the half-window of output plane `k`; `0` copies the input, as
-/// does any well too short for the notebook's `n > max(3, 2 * r + 1)` guard.
+/// `radii[k]` is the half-window of output plane `k`; `0` copies the input,
+/// matching `_smooth`'s own `if r > 0 else s` branch.
 #[cube(launch, launch_unchecked)]
 pub fn sg_smooth_kernel<F: Float + CubeElement>(
     gr: &Array<F>,
@@ -105,48 +120,25 @@ pub fn sg_smooth_kernel<F: Float + CubeElement>(
         let m = radii[k] as usize;
         let mut v = gr[ev_off + i];
 
-        // `ev_len > 2 * m + 1` and `ev_len > 3` are the notebook's guard; they
-        // also guarantee the window fits and that `s2`/`det` below are non-zero.
-        if m > 0 && ev_len > 3 && ev_len > 2 * m + 1 {
-            let w = 2 * m + 1;
-
-            // Window start, and where in centred coordinates this row sits. The
-            // two edge cases cannot both apply: that would need `ev_len < 2 * m`,
-            // which the guard above already excludes.
-            let mut s = 0usize;
-            if i + m >= ev_len {
-                s = ev_len - w;
-            } else if i >= m {
-                s = i - m;
+        if m > 0 {
+            let mut lo = 0usize;
+            if i >= m {
+                lo = i - m;
             }
-            let xe = F::cast_from(i) - F::cast_from(s) - F::cast_from(m);
+            let mut hi = i + m + 1;
+            if hi > ev_len {
+                hi = ev_len;
+            }
 
-            let mut s0 = F::new(0.0f32);
-            let mut s2 = F::new(0.0f32);
-            let mut s4 = F::new(0.0f32);
-            let mut t0 = F::new(0.0f32);
-            let mut t1 = F::new(0.0f32);
-            let mut t2 = F::new(0.0f32);
-
-            let mut j = 0usize;
-            while j < w {
-                let x = F::cast_from(j) - F::cast_from(m);
-                let x2 = x * x;
-                let y = gr[ev_off + s + j];
-                s0 += F::new(1.0f32);
-                s2 += x2;
-                s4 += x2 * x2;
-                t0 += y;
-                t1 += x * y;
-                t2 += x2 * y;
+            let mut acc = F::new(0.0f32);
+            let mut cnt = F::new(0.0f32);
+            let mut j = lo;
+            while j < hi {
+                acc += gr[ev_off + j];
+                cnt += F::new(1.0f32);
                 j += 1;
             }
-
-            let det = s0 * s4 - s2 * s2;
-            let a0 = (t0 * s4 - t2 * s2) / det;
-            let a1 = t1 / s2;
-            let a2 = (t2 * s0 - t0 * s2) / det;
-            v = a0 + a1 * xe + a2 * xe * xe;
+            v = acc / cnt;
         }
 
         out[k * rows + r] = v;
@@ -246,6 +238,8 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
     cfg_u: &Array<u32>,
     cfg_f: &Array<F>,
     out: &mut Array<F>,
+    hist_idx: &mut Array<u32>,
+    hist_parent: &mut Array<u32>,
     total_rows: u32,
     n_configs: u32,
     n_tasks: u32,
@@ -256,6 +250,7 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
     let mut b_cost = SharedMemory::<F>::new(max_beam);
     let mut c_idx = SharedMemory::<u32>::new(5 * max_beam);
     let mut c_cost = SharedMemory::<F>::new(5 * max_beam);
+    let mut c_parent = SharedMemory::<u32>::new(5 * max_beam);
     let mut c_dead = SharedMemory::<u32>::new(5 * max_beam);
 
     let t = UNIT_POS as usize;
@@ -342,6 +337,7 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
                 }
                 c_idx[u] = ni as u32;
                 c_cost[u] = cost;
+                c_parent[u] = b as u32;
                 u += cd;
             }
             sync_cube();
@@ -382,8 +378,15 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
             sync_cube();
 
             // ---- rank: the top `bs` survivors, cheapest first ---------------
-            // Survivors have distinct type-well indices, so `(cost, index)` is a
-            // total order and every rank is unique — the scatter cannot collide.
+            // Tie-break by candidate slot `u = b*5 + m`, not type-well index: the
+            // reference's `_beam_jit` is a hand-rolled selection sort over an
+            // array built in `(beam slot, move)` generation order, so on an exact
+            // cost tie it keeps whichever candidate was recorded *first* in that
+            // order — not the numerically lower type-well index. `u = b*5 + m`
+            // enumerates candidates in that same order (dedup already keeps only
+            // the lowest slot per surviving index, matching `_beam_jit`'s
+            // first-occurrence-wins dedup), so comparing `v < u3` here reproduces
+            // the reference's tie-break exactly.
             let mut u3 = t;
             while u3 < n_cand {
                 if c_dead[u3] == 0u32 {
@@ -394,7 +397,7 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
                     while v < n_cand {
                         if c_dead[v] == 0u32 {
                             let cv = c_cost[v];
-                            if cv < cu || (cv == cu && c_idx[v] < iu) {
+                            if cv < cu || (cv == cu && v < u3) {
                                 rank += 1;
                             }
                         }
@@ -403,21 +406,21 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
                     if rank < bs {
                         b_idx[rank] = iu;
                         b_cost[rank] = cu;
+                        // Record this step's survivors (every slot, not just the
+                        // current argmin) and which pre-step slot each descended
+                        // from, for the end-of-search backtrack below — see the
+                        // module doc's note on why this cannot emit greedily.
+                        let hist_off = (cfg * rows + ev_off + step) * max_beam + rank;
+                        hist_idx[hist_off] = iu;
+                        hist_parent[hist_off] = c_parent[u3];
                     }
                 }
                 u3 += cd;
             }
             sync_cube();
 
-            // ---- emit, then renormalise ------------------------------------
-            // Slot 0 is the cheapest surviving path. Read `best` before anyone
-            // rewrites it.
+            // ---- renormalise ------------------------------------------------
             let best = b_cost[0];
-            if t == 0 {
-                out[cfg * rows + ev_off + step] = tw_tvt[tw_off + b_idx[0] as usize];
-            }
-            sync_cube();
-
             let mut j3 = t;
             while j3 < bs {
                 let c = b_cost[j3];
@@ -429,6 +432,32 @@ pub fn beam_search_kernel<F: Float + CubeElement>(
             sync_cube();
 
             step += 1;
+        }
+
+        // ---- backtrack: find the cheapest final slot, then walk the history
+        // backward, emitting each step's survivor on the way. Inherently
+        // sequential (each step's slot is only known from the next step's
+        // parent pointer), so only one unit does it; every unit still executes
+        // the same number of `sync_cube()` calls, via the barrier at the top of
+        // the next task iteration (or falls straight through at the last task,
+        // where no further shared memory is touched by anyone).
+        if t == 0 && ev_len > 0 {
+            let mut best_slot = 0usize;
+            let mut s = 1usize;
+            while s < bs {
+                if b_cost[s] < b_cost[best_slot] {
+                    best_slot = s;
+                }
+                s += 1;
+            }
+            let mut slot = best_slot;
+            let mut step2 = ev_len;
+            while step2 > 0 {
+                step2 -= 1;
+                let hist_off = (cfg * rows + ev_off + step2) * max_beam + slot;
+                out[cfg * rows + ev_off + step2] = tw_tvt[tw_off + hist_idx[hist_off] as usize];
+                slot = hist_parent[hist_off] as usize;
+            }
         }
 
         task += cube_stride;

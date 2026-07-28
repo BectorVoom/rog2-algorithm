@@ -35,6 +35,28 @@ fn as_f32_vec(obj: &Bound<'_, PyAny>, field: &str) -> PyResult<Vec<f32>> {
         .map_err(|_| PyValueError::new_err(format!("`{field}` must be a 1-D float array")))
 }
 
+/// Same as [`as_f32_vec`], but keeps full f64 precision — the beam search's
+/// dynamic program needs it (see `beam_host`'s launch macros).
+fn as_f64_vec(obj: &Bound<'_, PyAny>, field: &str) -> PyResult<Vec<f64>> {
+    if let Ok(a) = obj.extract::<PyReadonlyArray1<f64>>() {
+        return Ok(a.as_slice()?.to_vec());
+    }
+    if let Ok(a) = obj.extract::<PyReadonlyArray1<f32>>() {
+        return Ok(a.as_slice()?.iter().map(|v| *v as f64).collect());
+    }
+    obj.extract::<Vec<f64>>()
+        .map_err(|_| PyValueError::new_err(format!("`{field}` must be a 1-D float array")))
+}
+
+fn scalar_f64(d: &Bound<'_, PyDict>, key: &str) -> PyResult<f64> {
+    match d.get_item(key)? {
+        Some(v) => v
+            .extract::<f64>()
+            .map_err(|_| PyValueError::new_err(format!("`{key}` must be a float"))),
+        None => Err(PyValueError::new_err(format!("well dict is missing `{key}`"))),
+    }
+}
+
 fn item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
     d.get_item(key)?
         .ok_or_else(|| PyValueError::new_err(format!("well dict is missing `{key}`")))
@@ -176,10 +198,10 @@ fn parse_beam_well(obj: &Bound<'_, PyAny>) -> PyResult<BeamWellInput> {
         .cast::<PyDict>()
         .map_err(|_| PyValueError::new_err("each well must be a dict"))?;
     Ok(BeamWellInput {
-        gr: as_f32_vec(&item(d, "gr")?, "gr")?,
-        tw_tvt: as_f32_vec(&item(d, "tw_tvt")?, "tw_tvt")?,
-        tw_gr: as_f32_vec(&item(d, "tw_gr")?, "tw_gr")?,
-        last_tvt: scalar(d, "last_tvt", None)?,
+        gr: as_f64_vec(&item(d, "gr")?, "gr")?,
+        tw_tvt: as_f64_vec(&item(d, "tw_tvt")?, "tw_tvt")?,
+        tw_gr: as_f64_vec(&item(d, "tw_gr")?, "tw_gr")?,
+        last_tvt: scalar_f64(d, "last_tvt")?,
     })
 }
 
@@ -199,7 +221,7 @@ fn parse_beam_configs(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<BeamConfig
     })?;
     Ok(raw
         .into_iter()
-        .map(|(bs, mc, es, r)| BeamConfig::new(bs, mc as f32, es as f32, r))
+        .map(|(bs, mc, es, r)| BeamConfig::new(bs, mc, es, r))
         .collect())
 }
 
@@ -209,7 +231,7 @@ fn parse_beam_configs(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<BeamConfig
 /// `tw_tvt` and `tw_gr` (the type-well log, sorted ascending by TVT), and
 /// `last_tvt` (the TVT the search starts from).
 ///
-/// Returns a dict with `beam_mean` (a list of per-well float32 arrays, the
+/// Returns a dict with `beam_mean` (a list of per-well float64 arrays, the
 /// ensemble mean over configs), `kept` (indices of the input wells that had a
 /// non-empty evaluation zone) and, when `with_per_config` is set, `per_config`
 /// (`[config][well]` arrays).
@@ -273,7 +295,7 @@ fn run_beam_batch<'py>(
 /// The notebook's `BEAM_CONFIGS`, as `(beam_size, move_cost, err_scale, radius)`
 /// tuples — the default ensemble `run_beam_batch` uses.
 #[pyfunction]
-fn notebook_beam_configs() -> Vec<(u32, f32, f32, u32)> {
+fn notebook_beam_configs() -> Vec<(u32, f64, f64, u32)> {
     NOTEBOOK_BEAM_CONFIGS
         .iter()
         .map(|c| (c.beam_size, c.move_cost, c.err_scale, c.radius))

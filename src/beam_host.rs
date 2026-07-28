@@ -12,32 +12,40 @@ use crate::beam::{
 use crate::beam_kernel::{beam_mean_kernel, beam_search_kernel, sg_smooth_kernel};
 use crate::PfError;
 
+// The beam search's dynamic program makes hard, strict-inequality comparisons
+// between accumulated path costs over thousands of sequential steps. The
+// notebook's numpy reference runs this in f64 (see beam_kernel's module docs);
+// f32 has enough rounding error at that depth to flip a near-tie decision and
+// send the search down a genuinely different path from that point on. So,
+// unlike the particle filter (which stays f32 for GPU throughput and tolerates
+// its own floating-point noise), the beam kernel launches in f64 to actually
+// match the reference instead of merely resembling it.
 #[cfg(feature = "checked-launch")]
 macro_rules! launch_sg {
-    ($($a:tt)*) => { sg_smooth_kernel::launch::<f32, R>($($a)*) };
+    ($($a:tt)*) => { sg_smooth_kernel::launch::<f64, R>($($a)*) };
 }
 #[cfg(not(feature = "checked-launch"))]
 macro_rules! launch_sg {
-    ($($a:tt)*) => { sg_smooth_kernel::launch_unchecked::<f32, R>($($a)*) };
+    ($($a:tt)*) => { sg_smooth_kernel::launch_unchecked::<f64, R>($($a)*) };
 }
 #[cfg(feature = "checked-launch")]
 macro_rules! launch_beam {
-    ($($a:tt)*) => { beam_search_kernel::launch::<f32, R>($($a)*) };
+    ($($a:tt)*) => { beam_search_kernel::launch::<f64, R>($($a)*) };
 }
 #[cfg(not(feature = "checked-launch"))]
 macro_rules! launch_beam {
-    ($($a:tt)*) => { beam_search_kernel::launch_unchecked::<f32, R>($($a)*) };
+    ($($a:tt)*) => { beam_search_kernel::launch_unchecked::<f64, R>($($a)*) };
 }
 #[cfg(feature = "checked-launch")]
 macro_rules! launch_beam_mean {
-    ($($a:tt)*) => { beam_mean_kernel::launch::<f32, R>($($a)*) };
+    ($($a:tt)*) => { beam_mean_kernel::launch::<f64, R>($($a)*) };
 }
 #[cfg(not(feature = "checked-launch"))]
 macro_rules! launch_beam_mean {
-    ($($a:tt)*) => { beam_mean_kernel::launch_unchecked::<f32, R>($($a)*) };
+    ($($a:tt)*) => { beam_mean_kernel::launch_unchecked::<f64, R>($($a)*) };
 }
 
-const F32: usize = std::mem::size_of::<f32>();
+const ELEM: usize = std::mem::size_of::<f64>();
 
 impl FlatBeamBatch {
     /// Rebases wells `[w0, w1)` into a standalone batch.
@@ -123,7 +131,7 @@ pub fn run_beam<R: Runtime>(
         .zip(&plane_of)
         .flat_map(|(c, p)| [c.beam_size, *p])
         .collect();
-    let cfg_f: Vec<f32> = configs
+    let cfg_f: Vec<f64> = configs
         .iter()
         .flat_map(|c| [c.move_cost, c.err_scale])
         .collect();
@@ -132,9 +140,13 @@ pub fn run_beam<R: Runtime>(
     let h_cfg_f = client.create_from_slice(bytemuck::cast_slice(&cfg_f));
     let h_radii = client.create_from_slice(bytemuck::cast_slice(&radii));
 
-    // The smoothing planes and the per-config trajectories are the two buffers
-    // that scale with the batch, so the chunk budget covers both.
-    for (w0, w1) in batch.chunks(n_planes + n_configs, opts.budget_bytes, F32) {
+    // Every per-row device buffer counts against the chunk budget: the
+    // smoothing planes and per-config trajectories (f64, `ELEM` each), and the
+    // `max_beam`-wide backtrack history (u32, two buffers) the search kernel
+    // now needs — see beam_kernel's "Global-memory history buffer" doc.
+    const U32: usize = std::mem::size_of::<u32>();
+    let per_row_bytes = (n_planes + n_configs) * ELEM + n_configs * max_beam * 2 * U32;
+    for (w0, w1) in batch.chunks(per_row_bytes, opts.budget_bytes) {
         let (sub, row0) = batch.sub_batch(w0, w1);
         let sub_wells = sub.n_wells();
         let sub_rows = sub.total_rows();
@@ -146,9 +158,12 @@ pub fn run_beam<R: Runtime>(
         let h_meta_u = client.create_from_slice(bytemuck::cast_slice(&sub.meta_u));
         let h_meta_f = client.create_from_slice(bytemuck::cast_slice(&sub.meta_f));
         let h_row_well = client.create_from_slice(bytemuck::cast_slice(&sub.row_well));
-        let h_sgr = client.empty(n_planes * sub_rows * F32);
-        let h_traj = client.empty(n_configs * sub_rows * F32);
-        let h_mean = client.empty(sub_rows * F32);
+        let h_sgr = client.empty(n_planes * sub_rows * ELEM);
+        let h_traj = client.empty(n_configs * sub_rows * ELEM);
+        let h_mean = client.empty(sub_rows * ELEM);
+        let hist_len = n_configs * sub_rows * max_beam;
+        let h_hist_idx = client.empty(hist_len * U32);
+        let h_hist_parent = client.empty(hist_len * U32);
 
         // ---- smooth -------------------------------------------------------
         let sg_threads = n_planes * sub_rows;
@@ -201,6 +216,8 @@ pub fn run_beam<R: Runtime>(
                 ArrayArg::from_raw_parts(h_cfg_u.clone(), cfg_u.len()),
                 ArrayArg::from_raw_parts(h_cfg_f.clone(), cfg_f.len()),
                 ArrayArg::from_raw_parts(h_traj.clone(), n_configs * sub_rows),
+                ArrayArg::from_raw_parts(h_hist_idx.clone(), hist_len),
+                ArrayArg::from_raw_parts(h_hist_parent.clone(), hist_len),
                 sub_rows as u32,
                 n_configs as u32,
                 n_tasks,
@@ -235,7 +252,7 @@ pub fn run_beam<R: Runtime>(
             let traj_bytes = client
                 .read_one(h_traj.clone())
                 .map_err(|e| PfError::Device(format!("{e:?}")))?;
-            let vals: &[f32] = bytemuck::cast_slice(&traj_bytes);
+            let vals: &[f64] = bytemuck::cast_slice(&traj_bytes);
             for c in 0..n_configs {
                 let src = &vals[c * sub_rows..(c + 1) * sub_rows];
                 let dst = c * total_rows + row0;
@@ -243,7 +260,7 @@ pub fn run_beam<R: Runtime>(
             }
         }
 
-        let _ = (h_gr, h_tw_tvt, h_tw_gr, h_meta_f, h_traj);
+        let _ = (h_gr, h_tw_tvt, h_tw_gr, h_meta_f, h_traj, h_hist_idx, h_hist_parent);
     }
 
     Ok(out)

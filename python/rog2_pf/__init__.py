@@ -258,9 +258,12 @@ def prepare_beam_well(hw, tw):
     )
 
     well = {
-        "gr": gr_all[ev.index].astype(np.float32),
-        "tw_tvt": tw_tvt.astype(np.float32),
-        "tw_gr": tw_gr.astype(np.float32),
+        # Kept at f64: the beam search's dynamic program makes strict-inequality
+        # cost comparisons over thousands of sequential steps, and the notebook's
+        # numpy reference runs entirely in f64 (see beam_host's launch macros).
+        "gr": gr_all[ev.index],
+        "tw_tvt": tw_tvt,
+        "tw_gr": tw_gr,
         "last_tvt": float(kn.iloc[-1].TVT_input),
     }
     return well, ev.index.values
@@ -323,15 +326,15 @@ def beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs=10, mc=20.0, es=144.0, r=2, **k
     ``tw_tvt`` would silently give a wrong answer; the notebook's callers all
     pass ``tw.sort_values('TVT')`` anyway, so this is a no-op for them.
     """
-    hgr = np.asarray(hgr, dtype=np.float32)
+    hgr = np.asarray(hgr, dtype=np.float64)
     if len(hgr) == 0:
         return np.array([float(last_tvt)])
 
     order = np.argsort(np.asarray(tw_tvt, dtype=np.float64), kind="stable")
     well = {
         "gr": hgr,
-        "tw_tvt": np.asarray(tw_tvt, dtype=np.float32)[order],
-        "tw_gr": np.asarray(tw_gr, dtype=np.float32)[order],
+        "tw_tvt": np.asarray(tw_tvt, dtype=np.float64)[order],
+        "tw_gr": np.asarray(tw_gr, dtype=np.float64)[order],
         "last_tvt": float(last_tvt),
     }
     res = run_beam_batch(
