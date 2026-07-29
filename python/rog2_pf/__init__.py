@@ -258,6 +258,13 @@ def lik_pf_batch(
     with_quality=False,
     with_seed_paths=False,
     cube_dim=256,
+    mom=None,
+    vn=None,
+    pn=None,
+    rough_p=None,
+    rough_r=None,
+    resamp=None,
+    lik_floor=None,
     **kwargs,
 ):
     """Batched drop-in for the notebook's ``lik_pf``.
@@ -278,6 +285,14 @@ def lik_pf_batch(
     ``out["pf_seed_liks"]``, their log-likelihoods — the two inputs
     :func:`pf_seed_branch_stats` needs. It multiplies the readback by
     ``n_seeds``, so it is off by default.
+
+    ``mom``/``vn``/``pn``/``rough_p``/``rough_r``/``resamp``/``lik_floor``
+    override the process model's own constants (the notebook's values, same as
+    :func:`run_batch`'s own defaults); leave any of them ``None`` to keep the
+    notebook-matching default. These are process-*model* parameters, not the
+    ensemble's size (``n_particles``/``n_seeds``) or its output blend
+    (``scales``) — see ``rog2-algorithm/README.md``'s ``run_batch`` section for
+    what each one does physically.
     """
     scales = tuple(float(s) for s in scales)
     prepared, indices, gsigs = [], [], []
@@ -305,12 +320,13 @@ def lik_pf_batch(
         n_seeds=int(n_seeds),
         cube_dim=int(cube_dim),
         backend=backend,
-        mom=_PF_MOM,
-        vn=_PF_VN,
-        pn=_PF_PN,
-        rough_p=_PF_ROUGH_P,
-        rough_r=_PF_ROUGH_R,
-        resamp=_PF_RESAMP,
+        mom=_PF_MOM if mom is None else float(mom),
+        vn=_PF_VN if vn is None else float(vn),
+        pn=_PF_PN if pn is None else float(pn),
+        rough_p=_PF_ROUGH_P if rough_p is None else float(rough_p),
+        rough_r=_PF_ROUGH_R if rough_r is None else float(rough_r),
+        resamp=_PF_RESAMP if resamp is None else float(resamp),
+        **({"lik_floor": float(lik_floor)} if lik_floor is not None else {}),
         with_std=bool(with_quality),
         with_seed_paths=bool(with_seed_paths),
         **kwargs,
@@ -421,6 +437,11 @@ def run_pf_lik_ensemble_scales(
     the kernel's `Determinism` section), so the split is the same *analysis* but
     not the same numbers the notebook's own PF produces — a threshold pinned
     against a numba run will not transfer unchanged.
+
+    ``mom``/``vn``/``pn``/``rough_p``/``rough_r``/``resamp``/``lik_floor``, if
+    passed as keywords, flow through ``**kwargs`` to :func:`lik_pf_batch`'s
+    same-named overrides — see its docstring for what each one does. Leave
+    them unset for the notebook-matching defaults.
 
     Prefer calling :func:`lik_pf_batch` directly across all your wells at once
     — one well's seed ensemble cannot fill a GPU either.
