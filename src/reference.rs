@@ -11,6 +11,58 @@ use crate::{PfError, PfOutput};
 const TWO_PI: f32 = 6.283_185_5;
 const INV_2P24: f32 = 5.960_464_5e-8;
 const DD_MAX: f32 = 600.0;
+const LOG2_E: f32 = core::f32::consts::LOG2_E;
+const LN2: f32 = core::f32::consts::LN_2;
+const TWO_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
+const PI_OVER_2: f32 = core::f32::consts::FRAC_PI_2;
+
+/// Scalar twin of [`crate::kernel::exp_precise`] — see that function for why the
+/// filter cannot use the platform `exp`.
+#[inline]
+fn exp_precise(x: f32) -> f32 {
+    let k = (x * LOG2_E).round();
+    let r = (-k).mul_add(LN2, x);
+
+    let mut p = 1.0f32 / 5040.0;
+    p = p.mul_add(r, 1.0 / 720.0);
+    p = p.mul_add(r, 1.0 / 120.0);
+    p = p.mul_add(r, 1.0 / 24.0);
+    p = p.mul_add(r, 1.0 / 6.0);
+    p = p.mul_add(r, 0.5);
+    p = p.mul_add(r, 1.0);
+    p = p.mul_add(r, 1.0);
+
+    p * 2.0f32.powf(k)
+}
+
+/// Scalar twins of [`crate::kernel::sin_precise`] / [`crate::kernel::cos_precise`],
+/// valid for the Box-Muller angle range `[0, 2*pi]`.
+#[inline]
+fn sin_cos_precise(x: f32) -> (f32, f32) {
+    let q = (x * TWO_OVER_PI).round();
+    let r = (-q).mul_add(PI_OVER_2, x);
+    let r2 = r * r;
+
+    let mut s = 1.0f32 / 362_880.0;
+    s = s.mul_add(r2, -1.0 / 5040.0);
+    s = s.mul_add(r2, 1.0 / 120.0);
+    s = s.mul_add(r2, -1.0 / 6.0);
+    s = s.mul_add(r2, 1.0);
+    let sr = s * r;
+
+    let mut c = 1.0f32 / 40320.0;
+    c = c.mul_add(r2, -1.0 / 720.0);
+    c = c.mul_add(r2, 1.0 / 24.0);
+    c = c.mul_add(r2, -0.5);
+    c = c.mul_add(r2, 1.0);
+
+    match (q as u32) & 3 {
+        1 => (c, -sr),
+        2 => (-sr, -c),
+        3 => (-c, sr),
+        _ => (sr, c),
+    }
+}
 
 #[inline]
 fn hash32(a: u32, b: u32) -> u32 {
@@ -26,12 +78,16 @@ fn hash32(a: u32, b: u32) -> u32 {
     h
 }
 
-/// One Box-Muller pair from a counter, matching the kernel's draw order.
+/// The `(radius, sin, cos)` of one Box-Muller pair, matching the kernel's draw
+/// order. The two normals are `rad * cos` and `rad * sin`; callers combine them
+/// with the surrounding multiply-add explicitly, so the rounding matches the
+/// kernel's `fma` exactly (see `kernel::pf_lik_kernel`).
 #[inline]
-fn normals(ctr: u32, k0: u32, k1: u32) -> (f32, f32) {
+fn normals(ctr: u32, k0: u32, k1: u32) -> (f32, f32, f32) {
     let rad = (-2.0 * unit_f(hash32(ctr, k0)).ln()).sqrt();
     let ang = TWO_PI * unit_f(hash32(ctr, k1));
-    (rad * ang.cos(), rad * ang.sin())
+    let (sn, cs) = sin_cos_precise(ang);
+    (rad, sn, cs)
 }
 
 #[inline]
@@ -40,8 +96,8 @@ fn unit_f(x: u32) -> f32 {
 }
 
 #[inline]
-fn interp1(grid: &[f32], v: f32, vmin: f32, step: f32) -> f32 {
-    let fi = (v - vmin) / step;
+fn interp1(grid: &[f32], v: f32, vmin: f32, inv_step: f32) -> f32 {
+    let fi = (v - vmin) * inv_step;
     if fi < 0.0 {
         return grid[0];
     }
@@ -50,7 +106,7 @@ fn interp1(grid: &[f32], v: f32, vmin: f32, step: f32) -> f32 {
         return grid[grid.len() - 1];
     }
     let t = fi - iu as f32;
-    grid[iu] * (1.0 - t) + grid[iu + 1] * t
+    grid[iu].mul_add(1.0 - t, grid[iu + 1] * t)
 }
 
 /// Reproduces the kernel's fused three-way tree reduction over `cube_dim` lanes.
@@ -134,16 +190,19 @@ pub fn run_single(wl: &WellInput, cfg: &PfConfig, seed: u32, preds: &mut [f32]) 
     let mut r1 = vec![0.0f32; cube_dim];
     let mut r2 = vec![0.0f32; cube_dim];
 
-    let tmax = wl.vmin + wl.grid.len() as f32 * wl.step;
+    let tmax = (wl.grid.len() as f32).mul_add(wl.step, wl.vmin);
+    // Mirrors the reciprocals `FlatBatch::build` uploads; see `batch.rs`.
+    let inv_step = 1.0 / wl.step;
+    let inv_gs = 1.0 / wl.gs;
     let lo_clamp = wl.vmin - 100.0;
     let hi_clamp = tmax + 100.0;
 
     let stream = wl.seed_base.wrapping_add(seed);
     for j in 0..n {
         let base = hash32(stream, j as u32);
-        let (g1, g2) = normals(base, 0, 1);
-        pos[j] = wl.ls + wl.init_spr * g1;
-        rate[j] = wl.ir + 0.01 * g2;
+        let (rad, sn, cs) = normals(base, 0, 1);
+        pos[j] = (wl.init_spr * rad).mul_add(cs, wl.ls);
+        rate[j] = (0.01 * rad).mul_add(sn, wl.ir);
         w[j] = inv_n;
     }
 
@@ -165,23 +224,24 @@ pub fn run_single(wl: &WellInput, cfg: &PfConfig, seed: u32, preds: &mut [f32]) 
             let (mut s_w, mut s_w2, mut s_wt) = (0.0f32, 0.0f32, 0.0f32);
             for p in start..end {
                 let ctr = hash32(hash32(stream, p as u32), step_key);
-                let (g1, g2) = normals(ctr, 0, 1);
+                let (rad, sn, cs) = normals(ctr, 0, 1);
 
-                let rj = cfg.mom * rate[p] + cfg.vn * g1;
-                let tvt = (pos[p] + rj * dm + cfg.pn * g2 - zi).clamp(lo_clamp, hi_clamp);
+                let rj = (cfg.vn * rad).mul_add(cs, cfg.mom * rate[p]);
+                let tvt = ((cfg.pn * rad).mul_add(sn, rj.mul_add(dm, pos[p])) - zi)
+                    .clamp(lo_clamp, hi_clamp);
                 rate[p] = rj;
                 pos[p] = tvt + zi;
 
-                let eg = interp1(&wl.grid, tvt, wl.vmin, wl.step);
-                let d = (gri - eg) / wl.gs;
+                let eg = interp1(&wl.grid, tvt, wl.vmin, inv_step);
+                let d = (gri - eg) * inv_gs;
                 let dd = (d * d).min(DD_MAX);
-                let lk = (-0.5 * dd).exp().max(cfg.lik_floor);
+                let lk = exp_precise(-0.5 * dd).max(cfg.lik_floor);
 
                 let wn = w[p] * lk;
                 w[p] = wn;
                 s_w += wn;
-                s_w2 += wn * wn;
-                s_wt += wn * tvt;
+                s_w2 = wn.mul_add(wn, s_w2);
+                s_wt = wn.mul_add(tvt, s_wt);
             }
             r0[t] = s_w;
             r1[t] = s_w2;
@@ -202,13 +262,13 @@ pub fn run_single(wl: &WellInput, cfg: &PfConfig, seed: u32, preds: &mut [f32]) 
             let u0 = unit_f(hash32(hash32(stream, 0xA5A5_5A5A), step_key)) * inv_n;
 
             for a in 0..n {
-                let u = u0 + a as f32 * inv_n;
+                let u = (a as f32).mul_add(inv_n, u0);
                 w[a] = lower_bound(&cum, n, u) as u32 as f32;
             }
             for b in 0..n {
                 let ci = w[b] as u32 as usize;
-                let (g1, _) = normals(hash32(hash32(stream, b as u32), step_key), 2, 3);
-                cum[b] = pos[ci] + cfg.rough_p * g1;
+                let (rad, _, cs) = normals(hash32(hash32(stream, b as u32), step_key), 2, 3);
+                cum[b] = (cfg.rough_p * rad).mul_add(cs, pos[ci]);
             }
             for t in 0..cube_dim {
                 let start = t * chunk;
@@ -224,8 +284,8 @@ pub fn run_single(wl: &WellInput, cfg: &PfConfig, seed: u32, preds: &mut [f32]) 
             }
             let src: Vec<usize> = w.iter().map(|v| *v as u32 as usize).collect();
             for e in 0..n {
-                let (_, g2) = normals(hash32(hash32(stream, e as u32), step_key), 2, 3);
-                cum[e] = rate[src[e]] + cfg.rough_r * g2;
+                let (rad, sn, _) = normals(hash32(hash32(stream, e as u32), step_key), 2, 3);
+                cum[e] = (cfg.rough_r * rad).mul_add(sn, rate[src[e]]);
             }
             for g in 0..n {
                 rate[g] = cum[g];
@@ -284,6 +344,17 @@ pub fn run_reference(
 
     let mut values = vec![0.0f32; n_out * total_rows];
     let mut all_liks = vec![0.0f32; kept.len() * seeds];
+    let mut pred_offsets = Vec::with_capacity(kept.len());
+    let mut pred_len = 0usize;
+    for &l in &ev_lens {
+        pred_offsets.push(pred_len as u32);
+        pred_len += l as usize * seeds;
+    }
+    let mut seed_paths = if cfg.with_seed_paths {
+        Some(vec![0.0f32; pred_len])
+    } else {
+        None
+    };
 
     for (w, &wi) in kept.iter().enumerate() {
         let wl = &wells[wi];
@@ -309,6 +380,10 @@ pub fn run_reference(
             len,
             &mut values[scales.len() * total_rows + off..][..len],
         );
+        if let Some(paths) = seed_paths.as_mut() {
+            let dst = pred_offsets[w] as usize;
+            paths[dst..dst + preds.len()].copy_from_slice(&preds);
+        }
         if cfg.with_std {
             let dst = &mut values[(scales.len() + 1) * total_rows + off..][..len];
             for (i, d) in dst.iter_mut().enumerate() {
@@ -317,12 +392,12 @@ pub fn run_reference(
                 for s in 0..seeds {
                     let v = preds[s * len + i];
                     m1 += v;
-                    m2 += v * v;
+                    m2 = v.mul_add(v, m2);
                 }
                 let inv = 1.0 / seeds as f32;
                 m1 *= inv;
                 m2 *= inv;
-                *d = (m2 - m1 * m1).max(0.0).sqrt();
+                *d = (-m1).mul_add(m1, m2).max(0.0).sqrt();
             }
         }
     }
@@ -331,6 +406,9 @@ pub fn run_reference(
         channels,
         values,
         liks: all_liks,
+        n_seeds: cfg.n_seeds,
+        seed_paths,
+        pred_offsets,
         ev_offsets,
         ev_lens,
         kept,
@@ -342,7 +420,48 @@ fn blend_into(preds: &[f32], wts: &[f32], len: usize, out: &mut [f32]) {
     for (s, wt) in wts.iter().enumerate() {
         let row = &preds[s * len..(s + 1) * len];
         for (o, p) in out.iter_mut().zip(row) {
-            *o += wt * p;
+            *o = wt.mul_add(*p, *o);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exp_precise;
+
+    /// `exp_precise` has to stay comfortably inside 2 ULP over the range the
+    /// likelihood can reach — `-0.5 * dd` down to `ln(lik_floor)`, about -27.6.
+    /// The point is not to beat libm (it does not) but to be the *same*
+    /// expression on the host and in the kernel, so that no backend's `exp`
+    /// gets a vote. wgpu's own `exp` is ~14 ULP over this range.
+    #[test]
+    fn exp_precise_is_accurate_over_the_likelihood_range() {
+        let mut worst_ulp = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for i in 0..200_001u32 {
+            let x = -27.6 * (i as f32) / 200_000.0;
+            let want = (x as f64).exp();
+            let ulp = ((exp_precise(x) as f64) - want).abs() / (want * 1.192_092_9e-7);
+            if ulp > worst_ulp {
+                worst_ulp = ulp;
+                worst_at = x;
+            }
+        }
+        assert!(
+            worst_ulp < 2.0,
+            "exp_precise is {worst_ulp:.2} ULP off at x = {worst_at}"
+        );
+    }
+
+    /// Below the likelihood floor the result is clamped anyway, but it still has
+    /// to decay rather than blow up or go NaN.
+    #[test]
+    fn exp_precise_decays_past_the_floor() {
+        for i in 0..600u32 {
+            let x = -(i as f32);
+            let v = exp_precise(x);
+            assert!(v.is_finite() && v >= 0.0, "exp_precise({x}) = {v}");
+            assert!(v <= 1.000_001, "exp_precise({x}) = {v} is not <= 1");
         }
     }
 }

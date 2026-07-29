@@ -62,13 +62,13 @@ pub fn pf_blend_kernel<F: Float + CubeElement>(
             while s < n_seeds as usize {
                 let v = preds[p_off + s * ev_len + i];
                 m1 += v;
-                m2 += v * v;
+                m2 = fma(v, v, m2);
                 s += 1;
             }
             let inv = F::new(1.0f32) / F::cast_from(n_seeds);
             m1 *= inv;
             m2 *= inv;
-            let mut var = m2 - m1 * m1;
+            let mut var = fma(-m1, m1, m2);
             if var < F::new(0.0f32) {
                 var = F::new(0.0f32);
             }
@@ -77,7 +77,7 @@ pub fn pf_blend_kernel<F: Float + CubeElement>(
             let wbase = (well * n_out as usize + k) * n_seeds as usize;
             let mut s = 0usize;
             while s < n_seeds as usize {
-                acc += wts[wbase + s] * preds[p_off + s * ev_len + i];
+                acc = fma(wts[wbase + s], preds[p_off + s * ev_len + i], acc);
                 s += 1;
             }
         }

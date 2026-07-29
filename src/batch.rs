@@ -31,6 +31,16 @@ pub struct PfConfig {
     /// Emit an extra `pf_pt_std` channel: the unweighted spread across seeds,
     /// which the notebook uses as a quality feature.
     pub with_std: bool,
+    /// Also bring each seed's own trajectory back from the device, not just the
+    /// seed-ensembled channels.
+    ///
+    /// The notebook's selector-side bimodal branch hedge is built on the raw
+    /// per-seed paths — it takes each seed's median TVT over the evaluation
+    /// rows and splits those 128 levels into two likelihood-weighted clusters —
+    /// so a caller that needs `branch_stats` needs this. It costs `n_seeds`
+    /// times the output size in readback, which is why it is off by default;
+    /// `pred_budget_bytes` already bounds the per-chunk size.
+    pub with_seed_paths: bool,
 }
 
 impl Default for PfConfig {
@@ -50,6 +60,7 @@ impl Default for PfConfig {
             lik_floor: 1e-12,
             pred_budget_bytes: 512 << 20,
             with_std: false,
+            with_seed_paths: false,
         }
     }
 }
@@ -207,6 +218,12 @@ impl FlatBatch {
 
             b.meta_u
                 .extend_from_slice(&[ev_off, ev_len, g_off, g_len, p_off, wl.seed_base]);
+            // `1/step` and `1/gs` are uploaded rather than divided for on the
+            // device: SPIR-V division is not correctly rounded, so a device
+            // `x / gs` lands on a different f32 than CUDA's or the host's for a
+            // quarter of inputs, and the likelihood amplifies that into resample
+            // decisions. A multiply by a host-computed reciprocal is IEEE-exact
+            // everywhere. See `kernel::pf_lik_kernel`.
             b.meta_f.extend_from_slice(&[
                 wl.vmin,
                 wl.step,
@@ -214,6 +231,8 @@ impl FlatBatch {
                 wl.ls,
                 wl.ir,
                 wl.init_spr,
+                1.0 / wl.step,
+                1.0 / wl.gs,
             ]);
 
             b.ev_offsets.push(ev_off);

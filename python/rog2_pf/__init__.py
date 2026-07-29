@@ -39,6 +39,8 @@ machines.
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 
 from ._rog2_pf import (
@@ -62,6 +64,8 @@ __all__ = [
     "lik_pf_batch",
     "run_particle_filter",
     "run_pf_lik_ensemble_scales",
+    "seed_base_for_well",
+    "pf_seed_branch_stats",
     "beam_search",
     "run_beam_ensemble",
     "run_beam_ensemble_batch",
@@ -156,6 +160,92 @@ def _quality(liks_row, n_rows, gs, pt_std):
     }
 
 
+def seed_base_for_well(wid):
+    """The notebook's per-well RNG seed base: ``md5(str(wid)) % 2**31``.
+
+    Reproduced bit for bit from ``run_pf_lik_ensemble_scales`` in cell 38, so a
+    well filtered here draws from the same stream index it would there. `None`
+    maps to 0, matching the notebook's own default.
+
+    Seeding per well is not cosmetic: the 128 seed trajectories *are* the
+    ensemble, and anything computed across them — the softmax blend, and above
+    all the selector's bimodal branch statistics — describes that particular
+    draw. Seeding every well identically makes those numbers a property of the
+    seed rather than of the well.
+    """
+    if wid is None:
+        return 0
+    return int(hashlib.md5(str(wid).encode("utf-8")).hexdigest(), 16) % (2**31)
+
+
+def pf_seed_branch_stats(seed_paths, liks, eval_rows=None, scale=5.0):
+    """The selector's PF seed-branch split, in the notebook's arithmetic.
+
+    ``seed_paths`` is ``[seed, eval_row]`` (what ``lik_pf_batch`` returns under
+    ``with_seed_paths=True``) and ``liks`` the matching per-seed total
+    log-likelihoods. Each seed is reduced to its median TVT over the evaluation
+    rows, those levels are weighted by a softmax of the log-likelihoods at
+    ``scale``, and a 1-D two-cluster split minimising within-cluster weighted SSE
+    gives the low/high centres and masses that cell 53's hedge qualifies on.
+
+    Returns the dict cell 53 expects, or ``{}`` when the well cannot be split
+    (fewer than 4 usable seeds, or no cut leaving 5% of the mass on both sides).
+    """
+    paths = np.asarray(seed_paths, dtype=float)
+    liks = np.asarray(liks, dtype=float)
+    if paths.ndim != 2 or paths.shape[0] != liks.shape[0]:
+        raise ValueError("seed_paths must be [seed, row] and match liks")
+
+    liks_n = liks - liks.max()
+    seed_weight = np.exp(liks_n / float(scale))
+    seed_weight = seed_weight / max(float(seed_weight.sum()), 1e-12)
+    level = np.nanmedian(paths, axis=1)
+
+    valid = np.isfinite(level) & np.isfinite(seed_weight) & (seed_weight > 0)
+    level = level[valid]
+    seed_weight = seed_weight[valid]
+    seed_weight = seed_weight / max(float(seed_weight.sum()), 1e-12)
+    if len(level) < 4:
+        return {}
+
+    order = np.argsort(level)
+    x = level[order]
+    w = seed_weight[order]
+    cw = np.cumsum(w)
+    cx = np.cumsum(w * x)
+    cx2 = np.cumsum(w * x * x)
+    total_w, total_x, total_x2 = float(cw[-1]), float(cx[-1]), float(cx2[-1])
+
+    best = None
+    for cut in range(1, len(x)):
+        wl = float(cw[cut - 1])
+        wr = total_w - wl
+        if wl < 0.05 or wr < 0.05:
+            continue
+        xl = float(cx[cut - 1])
+        xr = total_x - xl
+        ssel = float(cx2[cut - 1] - xl * xl / wl)
+        sser = float(total_x2 - cx2[cut - 1] - xr * xr / wr)
+        score = max(0.0, ssel) + max(0.0, sser)
+        if best is None or score < best[0]:
+            best = (score, wl, wr, xl / wl, xr / wr)
+    if best is None:
+        return {}
+
+    _, mass_low, mass_high, center_low, center_high = best
+    stats = dict(
+        center_low=float(center_low),
+        center_high=float(center_high),
+        mass_low=float(mass_low),
+        mass_high=float(mass_high),
+        weighted_center=float(np.sum(seed_weight * level)),
+        seed_count=int(len(level)),
+    )
+    if eval_rows is not None:
+        stats["eval_rows"] = np.asarray(eval_rows, dtype=int).tolist()
+    return stats
+
+
 def lik_pf_batch(
     pairs,
     n_particles=500,
@@ -163,8 +253,10 @@ def lik_pf_batch(
     scales=DEFAULT_SCALES,
     init_spr=4.5,
     seed_bases=None,
+    wids=None,
     backend="auto",
     with_quality=False,
+    with_seed_paths=False,
     cube_dim=256,
     **kwargs,
 ):
@@ -176,11 +268,26 @@ def lik_pf_batch(
 
     Batching is the whole point: 128 seeds x N wells become one grid, so a T4
     stays saturated instead of running one well at a time.
+
+    Pass ``wids`` (one well id per pair) to seed each well from its id the way
+    the notebook does — see :func:`seed_base_for_well`. ``seed_bases`` still
+    takes explicit integers and wins if both are given.
+
+    ``with_seed_paths=True`` adds ``out["pf_seed_paths"]``, a ``[seed, row]``
+    array of every seed's own trajectory over the evaluation rows, and
+    ``out["pf_seed_liks"]``, their log-likelihoods — the two inputs
+    :func:`pf_seed_branch_stats` needs. It multiplies the readback by
+    ``n_seeds``, so it is off by default.
     """
     scales = tuple(float(s) for s in scales)
     prepared, indices, gsigs = [], [], []
     for i, (hw, tw) in enumerate(pairs):
-        base = 0 if seed_bases is None else int(seed_bases[i])
+        if seed_bases is not None:
+            base = int(seed_bases[i])
+        elif wids is not None:
+            base = seed_base_for_well(wids[i])
+        else:
+            base = 0
         well, ev_index = prepare_well(hw, tw, init_spr=init_spr, seed_base=base)
         prepared.append(well)
         indices.append(ev_index)
@@ -205,6 +312,7 @@ def lik_pf_batch(
         rough_r=_PF_ROUGH_R,
         resamp=_PF_RESAMP,
         with_std=bool(with_quality),
+        with_seed_paths=bool(with_seed_paths),
         **kwargs,
     )
 
@@ -214,6 +322,11 @@ def lik_pf_batch(
 
     for slot, i in enumerate(live_positions):
         out = {c: res[c][slot] for c in channels}
+        if with_seed_paths:
+            # The branch split needs the paths and their log-likelihoods
+            # together, so they travel together.
+            out["pf_seed_paths"] = res["seed_paths"][slot]
+            out["pf_seed_liks"] = liks[slot]
         q = {}
         if with_quality:
             q = _quality(
@@ -271,20 +384,43 @@ def run_particle_filter(hw, tw, n_particles=500, seed=42, backend="auto", **kwar
 
 
 def run_pf_lik_ensemble_scales(
-    hw, tw, scales=DEFAULT_SCALES, n_particles=500, n_seeds=128, backend="auto", **kwargs
+    hw,
+    tw,
+    scales=DEFAULT_SCALES,
+    n_particles=500,
+    n_seeds=128,
+    branch_stats=None,
+    wid=None,
+    backend="auto",
+    **kwargs,
 ):
     """Name-compatible drop-in for the notebook's own ``run_pf_lik_ensemble_scales``.
 
-    Wraps :func:`lik_pf_batch`: returns one full-row array per requested scale
-    (keyed ``f"pf_scale_{s:g}"``) plus ``"pf_mean"``, with known rows preserved
-    from ``hw["TVT_input"]`` and evaluation rows carrying the seed-ensemble
-    estimate — the same contract as the notebook function.
+    Same signature and same return contract: one full-row array per requested
+    scale (keyed ``f"pf_scale_{s:g}"``) plus ``"pf_mean"``, with known rows
+    preserved from ``hw["TVT_input"]`` and evaluation rows carrying the
+    seed-ensemble estimate.
 
-    The notebook's ``branch_stats`` argument feeds its selector-side bimodal
-    hedge, which is analysis built on top of the raw per-seed paths; the GPU
-    kernel doesn't expose those paths (only the ensembled channels and, via
-    ``with_quality=True`` on :func:`lik_pf_batch`, a per-well quality scalar),
-    so it has no equivalent here and is not accepted.
+    ``wid`` seeds the well from its id exactly as the notebook does (see
+    :func:`seed_base_for_well`). Leaving it ``None`` seeds every well from 0,
+    which makes the whole 128-seed ensemble — and anything derived from its
+    spread, ``branch_stats`` above all — a property of the seed rather than of
+    the well. Pass it.
+
+    ``branch_stats``, if given a dict, is filled in place with the selector's
+    bimodal branch statistics (``center_low`` / ``center_high`` / ``mass_low`` /
+    ``mass_high`` / ``weighted_center`` / ``eval_rows`` / ``seed_count``), the
+    keys cell 53's hedge reads. It requires the per-seed trajectories, so it
+    turns on ``with_seed_paths`` and costs ``n_seeds`` times the readback; it is
+    only computed when the well has at least 10 evaluation rows, matching the
+    notebook's own guard. Exceptions are trapped into ``branch_stats['error']``
+    the way the notebook traps them, so a hedge failure cannot take down a run.
+
+    Note that these statistics describe *this* estimator's seed ensemble. The
+    GPU filter's RNG is counter-based rather than numba's Mersenne Twister (see
+    the kernel's `Determinism` section), so the split is the same *analysis* but
+    not the same numbers the notebook's own PF produces — a threshold pinned
+    against a numba run will not transfer unchanged.
 
     Prefer calling :func:`lik_pf_batch` directly across all your wells at once
     — one well's seed ensemble cannot fill a GPU either.
@@ -295,19 +431,35 @@ def run_pf_lik_ensemble_scales(
     if len(ev_index) == 0:
         return {k: base.copy() for k in (*scale_keys, "pf_mean")}
 
-    out, idx, _ = lik_pf_batch(
+    want_branch = branch_stats is not None
+    res = lik_pf_batch(
         [(hw, tw)],
         n_particles=n_particles,
         n_seeds=n_seeds,
         scales=tuple(float(s) for s in scales),
+        seed_bases=[seed_base_for_well(wid)],
         backend=backend,
+        with_seed_paths=want_branch,
         **kwargs,
-    )[0]
+    )
+    out, idx, _ = res[0]
+
     result = {}
     for k in (*scale_keys, "pf_mean"):
         arr = base.copy()
         arr[idx] = out[k]
         result[k] = arr
+
+    if want_branch:
+        try:
+            if len(idx) >= 10:
+                stats = pf_seed_branch_stats(
+                    out["pf_seed_paths"], out["pf_seed_liks"], eval_rows=idx
+                )
+                if stats:
+                    branch_stats.update(stats)
+        except Exception as exc:  # matches the notebook's own trap
+            branch_stats["error"] = repr(exc)
     return result
 
 

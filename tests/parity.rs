@@ -136,3 +136,72 @@ fn filter_beats_the_last_known_baseline() {
         "particle filter RMSE {pf} should beat last-known baseline {base}"
     );
 }
+
+/// The per-seed trajectories the selector's branch hedge is built on must come
+/// back from the device intact, and must be the same paths the ensembled
+/// channels were blended from — `pf_mean` is their unweighted mean, so that is
+/// the cheapest way to prove the readback is aligned rather than transposed or
+/// off by a well.
+#[test]
+fn seed_paths_round_trip_and_agree_with_pf_mean() {
+    let cfg = PfConfig {
+        with_seed_paths: true,
+        ..cfg()
+    };
+    let wells: Vec<_> = (0..3)
+        .map(|s| synthetic_well(s + 1, 30 + 7 * s as usize).0)
+        .collect();
+
+    let gpu = run_on(Backend::Cpu, &wells, &cfg, &SCALES).expect("cubecl run");
+    let cpu = run_reference(&wells, &cfg, &SCALES).expect("reference run");
+
+    for w in 0..gpu.ev_lens.len() {
+        let len = gpu.ev_lens[w] as usize;
+        let g = gpu.well_seed_paths(w).expect("seed paths requested");
+        let c = cpu.well_seed_paths(w).expect("seed paths requested");
+        assert_eq!(g.len(), len * cfg.n_seeds as usize);
+        assert_eq!(g.len(), c.len());
+
+        let worst = g
+            .iter()
+            .zip(c)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= 1e-4, "well {w}: seed paths differ by {worst}");
+
+        // `pf_mean` is the unweighted mean over seeds of exactly these paths.
+        let mean = gpu.well_channel("pf_mean", w).unwrap();
+        for i in 0..len {
+            let acc: f32 = (0..cfg.n_seeds as usize)
+                .map(|s| gpu.seed_path(w, s).unwrap()[i])
+                .sum();
+            let got = acc / cfg.n_seeds as f32;
+            assert!(
+                (got - mean[i]).abs() <= 1e-3 * mean[i].abs().max(1.0),
+                "well {w} row {i}: seed-path mean {got} vs pf_mean {}",
+                mean[i]
+            );
+        }
+    }
+}
+
+/// Asking for the paths must not perturb the answer.
+#[test]
+fn seed_paths_do_not_change_the_channels() {
+    let wells: Vec<_> = (0..2)
+        .map(|s| synthetic_well(s + 1, 30).0)
+        .collect();
+    let plain = run_on(Backend::Cpu, &wells, &cfg(), &SCALES).expect("plain run");
+    let with = run_on(
+        Backend::Cpu,
+        &wells,
+        &PfConfig {
+            with_seed_paths: true,
+            ..cfg()
+        },
+        &SCALES,
+    )
+    .expect("seed-path run");
+    assert_eq!(plain.values, with.values);
+    assert_eq!(plain.liks, with.liks);
+}

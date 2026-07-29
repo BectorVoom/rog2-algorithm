@@ -7,7 +7,7 @@ use cubek_std::cube_count::cube_count_spread_with_total;
 
 use crate::batch::{FlatBatch, PfConfig, WellInput, seed_weights};
 use crate::blend::pf_blend_kernel;
-use crate::kernel::pf_lik_kernel;
+use crate::kernel::{META_F_STRIDE, pf_lik_kernel};
 use crate::{PfError, PfOutput};
 
 /// Bounds-checked launches are used when the `checked-launch` feature is on;
@@ -56,7 +56,7 @@ impl FlatBatch {
             z: self.z[row0..row1].to_vec(),
             gr: self.gr[row0..row1].to_vec(),
             grid: self.grid[g0..g1].to_vec(),
-            meta_f: self.meta_f[w0 * 6..w1 * 6].to_vec(),
+            meta_f: self.meta_f[w0 * META_F_STRIDE..w1 * META_F_STRIDE].to_vec(),
             ..Default::default()
         };
 
@@ -121,6 +121,13 @@ pub fn run_pf<R: Runtime>(
         channels,
         values: vec![0.0; n_out * total_rows],
         liks: vec![0.0; n_wells * n_seeds as usize],
+        n_seeds,
+        seed_paths: if cfg.with_seed_paths {
+            Some(vec![0.0; total_rows * n_seeds as usize])
+        } else {
+            None
+        },
+        pred_offsets: batch.pred_offsets.clone(),
         ev_offsets: batch.ev_offsets.clone(),
         ev_lens: batch.ev_lens.clone(),
         kept,
@@ -190,6 +197,17 @@ pub fn run_pf<R: Runtime>(
                 smem,
                 cfg.cube_dim as usize,
             );
+        }
+
+        // ---- per-seed trajectories (opt-in; `n_seeds` times the output size) --
+        if let Some(paths) = out.seed_paths.as_mut() {
+            let bytes = client
+                .read_one(h_preds.clone())
+                .map_err(|e| PfError::Device(format!("{e:?}")))?;
+            let vals: &[f32] = bytemuck::cast_slice(&bytes);
+            // `sub`'s pred offsets are chunk-relative; rebase onto the parent.
+            let dst0 = batch.pred_offsets[w0] as usize;
+            paths[dst0..dst0 + sub.pred_len].copy_from_slice(&vals[..sub.pred_len]);
         }
 
         // ---- seed weights (needs the log-likelihoods back) -----------------

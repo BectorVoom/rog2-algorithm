@@ -40,6 +40,31 @@
 //! `(seed_base, n_particles)`, but are not bit-identical to the numba
 //! implementation. Nothing carries RNG state, so resampling — which permutes
 //! particles between slots — cannot duplicate a stream.
+//!
+//! # Backend-independent arithmetic
+//!
+//! Determinism across *backends* needs more than a counter-based RNG, because
+//! systematic resampling turns rounding into a discrete choice: the normalised
+//! weights are prefix-summed and `lower_bound` picks which particle each
+//! resampling slot copies, so a single ULP can hand a slot to its neighbour and
+//! the trajectory never comes back. Three things had to be pinned down, all of
+//! them places where a shader compiler is allowed to differ from `rustc` and
+//! from `nvcc`:
+//!
+//! * **`exp`.** wgpu's is the raw hardware `exp2(x * log2 e)`, ~14 ULP over the
+//!   likelihood's range. [`exp_precise`] replaces it.
+//! * **`sin` / `cos`.** AMD's are ~4e-7 absolute, enough to seed two backends
+//!   with different particle clouds. [`sin_precise`] / [`cos_precise`] replace
+//!   them over the Box-Muller angle range.
+//! * **Multiply-add contraction and division.** wgpu contracts every
+//!   `a * b + c` into an FMA and `rustc` contracts none, so every multiply-add
+//!   in the weight path is written as an explicit [`fma`]. SPIR-V division is
+//!   not correctly rounded either, so `1 / step` and `1 / gs` are computed on
+//!   the host (see [`crate::batch::FlatBatch::build`]) and multiplied here.
+//!
+//! What is left is `ln` and `sqrt` in the Box-Muller radius, still the
+//! hardware's at ~1.3 and ~0.7 ULP; they are what remains of the wgpu-vs-CPU
+//! disagreement measured by `tests/wgpu_parity.rs`.
 
 use cubecl::prelude::*;
 
@@ -50,10 +75,17 @@ const INV_2P24: f32 = 5.960_464_5e-8;
 /// Matches the CPU version's `if dd > 600.: dd = 600.`.
 const DD_MAX: f32 = 600.0;
 
+/// `log2(e)` and `ln 2`, for [`exp_precise`].
+const LOG2_E: f32 = core::f32::consts::LOG2_E;
+const LN2: f32 = core::f32::consts::LN_2;
+/// `2/pi` and `pi/2`, for [`sin_precise`] / [`cos_precise`].
+const TWO_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
+const PI_OVER_2: f32 = core::f32::consts::FRAC_PI_2;
+
 /// Number of `u32` metadata slots per well.
 pub const META_U_STRIDE: usize = 6;
 /// Number of float metadata slots per well.
-pub const META_F_STRIDE: usize = 6;
+pub const META_F_STRIDE: usize = 8;
 
 // ---------------------------------------------------------------------------
 // RNG
@@ -79,6 +111,155 @@ pub fn unit_f<F: Float>(x: u32) -> F {
 }
 
 // ---------------------------------------------------------------------------
+// Likelihood exponential
+// ---------------------------------------------------------------------------
+
+/// `exp(x)` within ~1.2 ULP, and — the actual point — bit-identical on every
+/// backend and in the scalar reference.
+///
+/// `Float::exp` is not equally accurate everywhere. CUDA and the CPU runtime
+/// call an argument-reduced `expf` (~1 ULP), but wgpu lowers it to the raw
+/// hardware `exp2(x * log2 e)`, and rounding that product in f32 costs ~14 ULP —
+/// 1.7e-6 of relative error — at the tail of the range the observation
+/// likelihood uses (`x` reaches `ln(lik_floor)`, about -27.6). That is far too
+/// coarse for this filter: the per-step weights feed a prefix scan whose
+/// `lower_bound` boundaries decide *which particle* systematic resampling
+/// duplicates, so a 1e-6 wobble flips whole particle selections, and after a few
+/// dozen steps the trajectory has drifted feet away from the CUDA/CPU answer.
+/// Measured on a Radeon 840M: `pf_mean` diverged by up to 0.46 ft at 128
+/// particles, where the CPU runtime tracked the scalar reference to 4e-6 ft.
+///
+/// The argument reduction here moves that error into a polynomial instead: `x`
+/// becomes `k * ln 2 + r` with `|r| <= ln2/2`, `exp(r)` comes from a degree-7
+/// Taylor series (relative error < 5e-9 over that interval), and `2^k` is exact.
+/// The residual is `k * (ln 2 - f32(ln 2))`, under 8e-8 wherever the result
+/// clears `lik_floor`.
+///
+/// Sized for f32, which is what the particle filter launches; an f64
+/// instantiation is still correct but no more accurate than about 1e-7.
+#[cube]
+pub fn exp_precise<F: Float>(x: F) -> F {
+    let k = (x * F::new(LOG2_E)).round();
+    // A single `fma`, not a two-word Cody-Waite split of `ln 2`: the split's two
+    // constants sum back to `LN2` exactly in f32, so wgpu's shader compiler folds
+    // them together and fuses the result anyway (verified: it emits exactly this
+    // expression), while rustc leaves the split alone. Spelling the folded form
+    // is what makes device and host agree bit for bit, and it costs nothing —
+    // one rounded `fma` keeps `|r| <= ln2/2` and the residual `k * (ln 2 - LN2)`
+    // stays under 8e-8 across the range that clears `lik_floor`.
+    let r = fma(-k, F::new(LN2), x);
+
+    // Explicit `fma`, not `p * r + c`: whether a backend contracts a multiply-add
+    // is its own choice (SPIR-V may, rustc does not), and an unmatched
+    // contraction is exactly the 1-ULP wobble this function exists to remove.
+    // The scalar twin in `reference.rs` spells the same chain with `mul_add`.
+    let mut p = F::new(1.0f32 / 5040.0);
+    p = fma(p, r, F::new(1.0f32 / 720.0));
+    p = fma(p, r, F::new(1.0f32 / 120.0));
+    p = fma(p, r, F::new(1.0f32 / 24.0));
+    p = fma(p, r, F::new(1.0f32 / 6.0));
+    p = fma(p, r, F::new(0.5f32));
+    p = fma(p, r, F::new(1.0f32));
+    p = fma(p, r, F::new(1.0f32));
+
+    // `2^k` for integral `k`. CubeCL's `Float` bound has no `exp2`, but `powf`
+    // with a base of two lowers to `exp2(k * log2 2)` — an exact scaling — on
+    // every backend here.
+    p * F::powf(F::new(2.0f32), k)
+}
+
+// ---------------------------------------------------------------------------
+// Box-Muller trigonometry
+// ---------------------------------------------------------------------------
+
+/// Quadrant reduction shared by [`sin_precise`] and [`cos_precise`].
+///
+/// Returns `x - q * (pi/2)` with `|r| <= pi/4`; the caller re-derives `q` for the
+/// quadrant select. A single `fma`, so no backend gets to choose an association
+/// (see [`exp_precise`] for what happens when one does).
+#[cube]
+fn quadrant_r<F: Float>(x: F, q: F) -> F {
+    fma(-q, F::new(PI_OVER_2), x)
+}
+
+/// `sin(x)` for the Box-Muller angle `x` in `[0, 2*pi]`, identical on every
+/// backend.
+///
+/// AMD's `v_sin_f32` (what wgpu's `sin` becomes) is good to about 4e-7 absolute,
+/// roughly 3.5 ULP, and CUDA's `sinf` rounds differently again. That error is
+/// multiplied by `init_spr` when the cloud is seeded, which puts it above one
+/// ULP of a particle position — so the two backends start from different clouds
+/// and the resampler compounds the difference from there. A quadrant reduction
+/// plus a degree-9 Taylor series over `|r| <= pi/4` is both tighter (~1.5 ULP,
+/// bounded by `q * (pi/2 - f32(pi/2))`) and, more to the point, the same
+/// expression everywhere.
+///
+/// Only valid for `x` in `[0, 2*pi]`, which is all `TWO_PI * unit_f(..)` can
+/// produce: there is no Payne-Hanek fallback for large arguments.
+#[cube]
+pub fn sin_precise<F: Float>(x: F) -> F {
+    let q = (x * F::new(TWO_OVER_PI)).round();
+    let r = quadrant_r::<F>(x, q);
+    let r2 = r * r;
+
+    let mut s = F::new(1.0f32 / 362_880.0);
+    s = fma(s, r2, F::new(-1.0f32 / 5040.0));
+    s = fma(s, r2, F::new(1.0f32 / 120.0));
+    s = fma(s, r2, F::new(-1.0f32 / 6.0));
+    s = fma(s, r2, F::new(1.0f32));
+    let sr = s * r;
+
+    let mut c = F::new(1.0f32 / 40320.0);
+    c = fma(c, r2, F::new(-1.0f32 / 720.0));
+    c = fma(c, r2, F::new(1.0f32 / 24.0));
+    c = fma(c, r2, F::new(-0.5f32));
+    c = fma(c, r2, F::new(1.0f32));
+
+    let qi = u32::cast_from(q) & 3u32;
+    let mut out = sr;
+    if qi == 1u32 {
+        out = c;
+    } else if qi == 2u32 {
+        out = -sr;
+    } else if qi == 3u32 {
+        out = -c;
+    }
+    out
+}
+
+/// `cos(x)` for the Box-Muller angle `x` in `[0, 2*pi]` — see [`sin_precise`].
+#[cube]
+pub fn cos_precise<F: Float>(x: F) -> F {
+    let q = (x * F::new(TWO_OVER_PI)).round();
+    let r = quadrant_r::<F>(x, q);
+    let r2 = r * r;
+
+    let mut s = F::new(1.0f32 / 362_880.0);
+    s = fma(s, r2, F::new(-1.0f32 / 5040.0));
+    s = fma(s, r2, F::new(1.0f32 / 120.0));
+    s = fma(s, r2, F::new(-1.0f32 / 6.0));
+    s = fma(s, r2, F::new(1.0f32));
+    let sr = s * r;
+
+    let mut c = F::new(1.0f32 / 40320.0);
+    c = fma(c, r2, F::new(-1.0f32 / 720.0));
+    c = fma(c, r2, F::new(1.0f32 / 24.0));
+    c = fma(c, r2, F::new(-0.5f32));
+    c = fma(c, r2, F::new(1.0f32));
+
+    let qi = u32::cast_from(q) & 3u32;
+    let mut out = c;
+    if qi == 1u32 {
+        out = -sr;
+    } else if qi == 2u32 {
+        out = -c;
+    } else if qi == 3u32 {
+        out = sr;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Type-well GR grid lookup
 // ---------------------------------------------------------------------------
 
@@ -89,8 +270,8 @@ pub fn unit_f<F: Float>(x: u32) -> F {
 /// while this clamps to `grid[0]`. Particle TVT is clamped to `vmin - 100` before
 /// the lookup, so that window is unreachable in practice.
 #[cube]
-fn interp1<F: Float>(grid: &Array<F>, off: usize, len: usize, v: F, vmin: F, step: F) -> F {
-    let fi = (v - vmin) / step;
+fn interp1<F: Float>(grid: &Array<F>, off: usize, len: usize, v: F, vmin: F, inv_step: F) -> F {
+    let fi = (v - vmin) * inv_step;
     let mut out = grid[off];
     if fi >= F::new(0.0f32) {
         let iu = u32::cast_from(fi) as usize;
@@ -100,7 +281,11 @@ fn interp1<F: Float>(grid: &Array<F>, off: usize, len: usize, v: F, vmin: F, ste
             let t = fi - F::cast_from(iu);
             let a = grid[off + iu];
             let b = grid[off + iu + 1];
-            out = a * (F::new(1.0f32) - t) + b * t;
+            // Explicit `fma` for the same reason as in `exp_precise`: left as
+            // `a * (1 - t) + b * t` the backends are free to disagree on whether
+            // to contract, and a 1-ULP wobble in the expected GR is multiplied by
+            // `0.5 * dd` (up to 300) once it reaches the likelihood.
+            out = fma(a, F::new(1.0f32) - t, b * t);
         }
     }
     out
@@ -236,7 +421,7 @@ fn lower_bound<F: Float>(cum: &mut SharedMemory<F>, n: usize, u: F) -> usize {
 /// | 4                      | offset of this well's block in `preds`          |
 /// | 5                      | per-well RNG seed base                         |
 ///
-/// | `meta_f[well * 6 + k]` | meaning                                        |
+/// | `meta_f[well * 8 + k]` | meaning                                        |
 /// |------------------------|------------------------------------------------|
 /// | 0                      | `vmin`: TVT of the first GR grid sample         |
 /// | 1                      | `step`: GR grid spacing in TVT                  |
@@ -244,6 +429,8 @@ fn lower_bound<F: Float>(cum: &mut SharedMemory<F>, n: usize, u: F) -> usize {
 /// | 3                      | `ls`: last-known `TVT_input + Z` (initial pos)  |
 /// | 4                      | `ir`: initial along-hole TVT rate               |
 /// | 5                      | `init_spr`: initial position spread             |
+/// | 6                      | `1 / step`, precomputed on the host             |
+/// | 7                      | `1 / gs`, precomputed on the host               |
 ///
 /// `preds[pred_off + seed * ev_len + i]` receives the filtered TVT estimate and
 /// `liks[well * n_seeds + seed]` the total log-likelihood of the seed.
@@ -310,14 +497,15 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
         let p_off = meta_u[well * 6 + 4] as usize;
         let well_seed = meta_u[well * 6 + 5];
 
-        let vmin = meta_f[well * 6];
-        let step = meta_f[well * 6 + 1];
-        let gs = meta_f[well * 6 + 2];
-        let ls = meta_f[well * 6 + 3];
-        let ir = meta_f[well * 6 + 4];
-        let spr = meta_f[well * 6 + 5];
+        let vmin = meta_f[well * 8];
+        let step = meta_f[well * 8 + 1];
+        let ls = meta_f[well * 8 + 3];
+        let ir = meta_f[well * 8 + 4];
+        let spr = meta_f[well * 8 + 5];
+        let inv_step = meta_f[well * 8 + 6];
+        let inv_gs = meta_f[well * 8 + 7];
 
-        let tmax = vmin + F::cast_from(g_len) * step;
+        let tmax = fma(F::cast_from(g_len), step, vmin);
         let lo_clamp = vmin - F::new(100.0f32);
         let hi_clamp = tmax + F::new(100.0f32);
 
@@ -328,8 +516,8 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
             let base = hash32(stream, j as u32);
             let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(base, 0u32)).ln()).sqrt();
             let ang = F::new(TWO_PI) * unit_f::<F>(hash32(base, 1u32));
-            pos[j] = ls + spr * rad * ang.cos();
-            rate[j] = ir + F::new(0.01f32) * rad * ang.sin();
+            pos[j] = fma(spr * rad, cos_precise::<F>(ang), ls);
+            rate[j] = fma(F::new(0.01f32) * rad, sin_precise::<F>(ang), ir);
             w[j] = inv_n;
             j += 1;
         }
@@ -366,8 +554,8 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 let rad = (F::new(-2.0f32) * u1.ln()).sqrt();
                 let ang = F::new(TWO_PI) * u2;
 
-                let rj = mom * rate[p] + vn * rad * ang.cos();
-                let mut tvt = pos[p] + rj * dm + pn * rad * ang.sin() - zi;
+                let rj = fma(vn * rad, cos_precise::<F>(ang), mom * rate[p]);
+                let mut tvt = fma(pn * rad, sin_precise::<F>(ang), fma(rj, dm, pos[p])) - zi;
                 if tvt < lo_clamp {
                     tvt = lo_clamp;
                 }
@@ -377,13 +565,13 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 rate[p] = rj;
                 pos[p] = tvt + zi;
 
-                let eg = interp1::<F>(grid, g_off, g_len, tvt, vmin, step);
-                let d = (gri - eg) / gs;
+                let eg = interp1::<F>(grid, g_off, g_len, tvt, vmin, inv_step);
+                let d = (gri - eg) * inv_gs;
                 let mut dd = d * d;
                 if dd > F::new(DD_MAX) {
                     dd = F::new(DD_MAX);
                 }
-                let mut lk = (F::new(-0.5f32) * dd).exp();
+                let mut lk = exp_precise::<F>(F::new(-0.5f32) * dd);
                 if lk < lik_floor {
                     lk = lik_floor;
                 }
@@ -391,8 +579,8 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 let wn = w[p] * lk;
                 w[p] = wn;
                 s_w += wn;
-                s_w2 += wn * wn;
-                s_wt += wn * tvt;
+                s_w2 = fma(wn, wn, s_w2);
+                s_wt = fma(wn, tvt, s_wt);
                 p += 1;
             }
 
@@ -428,7 +616,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 // 1/N below, so it can carry the indices without an extra buffer.
                 let mut a = start;
                 while a < end {
-                    let u = u0 + F::cast_from(a) * inv_n;
+                    let u = fma(F::cast_from(a), inv_n, u0);
                     w[a] = F::cast_from(lower_bound::<F>(&mut cum, n, u) as u32);
                     a += 1;
                 }
@@ -441,7 +629,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                     let rctr = hash32(hash32(stream, b as u32), step_key);
                     let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(rctr, 2u32)).ln()).sqrt();
                     let ang = F::new(TWO_PI) * unit_f::<F>(hash32(rctr, 3u32));
-                    cum[b] = pos[ci] + rough_p * rad * ang.cos();
+                    cum[b] = fma(rough_p * rad, cos_precise::<F>(ang), pos[ci]);
                     b += 1;
                 }
                 sync_cube();
@@ -463,7 +651,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                     let rctr = hash32(hash32(stream, e as u32), step_key);
                     let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(rctr, 2u32)).ln()).sqrt();
                     let ang = F::new(TWO_PI) * unit_f::<F>(hash32(rctr, 3u32));
-                    cum[e] = rate[ci] + rough_r * rad * ang.sin();
+                    cum[e] = fma(rough_r * rad, sin_precise::<F>(ang), rate[ci]);
                     e += 1;
                 }
                 sync_cube();

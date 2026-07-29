@@ -70,6 +70,15 @@ pub struct PfOutput {
     pub values: Vec<f32>,
     /// Per-seed total log-likelihood, `[well][seed]`.
     pub liks: Vec<f32>,
+    /// Seeds per well — the stride of `liks` and `seed_paths`.
+    pub n_seeds: u32,
+    /// Every seed's own trajectory, `[well][seed][row]`, present only when
+    /// [`PfConfig::with_seed_paths`] was set. Well `w` starts at
+    /// `pred_offsets[w]` and runs for `n_seeds * ev_lens[w]` elements; use
+    /// [`PfOutput::well_seed_paths`] rather than indexing by hand.
+    pub seed_paths: Option<Vec<f32>>,
+    /// Start of each well's block within `seed_paths`.
+    pub pred_offsets: Vec<u32>,
     /// Start of each well's rows within a channel.
     pub ev_offsets: Vec<u32>,
     /// Evaluation row count per well.
@@ -90,6 +99,22 @@ impl PfOutput {
         let k = self.channels.iter().position(|c| c == name)?;
         let n = self.total_rows();
         Some(&self.values[k * n..(k + 1) * n])
+    }
+
+    /// One well's per-seed trajectories, `[seed][row]` row-major, or `None` if
+    /// [`PfConfig::with_seed_paths`] was not set.
+    pub fn well_seed_paths(&self, well: usize) -> Option<&[f32]> {
+        let paths = self.seed_paths.as_ref()?;
+        let off = *self.pred_offsets.get(well)? as usize;
+        let len = *self.ev_lens.get(well)? as usize * self.n_seeds as usize;
+        paths.get(off..off + len)
+    }
+
+    /// One seed's trajectory for one well.
+    pub fn seed_path(&self, well: usize, seed: usize) -> Option<&[f32]> {
+        let len = *self.ev_lens.get(well)? as usize;
+        let block = self.well_seed_paths(well)?;
+        block.get(seed * len..(seed + 1) * len)
     }
 
     /// One well's slice of one output channel.

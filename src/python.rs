@@ -122,6 +122,7 @@ fn parse_well(obj: &Bound<'_, PyAny>) -> PyResult<WellInput> {
     lik_floor = 1e-12,
     pred_budget_mb = 512,
     with_std = false,
+    with_seed_paths = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn run_batch<'py>(
@@ -141,6 +142,7 @@ fn run_batch<'py>(
     lik_floor: f32,
     pred_budget_mb: usize,
     with_std: bool,
+    with_seed_paths: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed: Vec<WellInput> = wells
         .iter()
@@ -160,6 +162,7 @@ fn run_batch<'py>(
         lik_floor,
         pred_budget_bytes: pred_budget_mb << 20,
         with_std,
+        with_seed_paths,
     };
 
     // The kernel does not touch Python state, so other threads can run.
@@ -188,6 +191,20 @@ fn run_batch<'py>(
         .map(|c| c.to_vec())
         .collect();
     result.set_item("liks", PyArray2::from_vec2(py, &liks_rows)?)?;
+    if with_seed_paths {
+        // `[seed, row]` per well: the layout the notebook's `pred_arr` uses, so
+        // the selector's branch split can be taken straight off it.
+        let per_well = PyList::empty(py);
+        for w in 0..n_wells {
+            let len = out.ev_lens[w] as usize;
+            let block = out
+                .well_seed_paths(w)
+                .ok_or_else(|| PyValueError::new_err("seed paths missing"))?;
+            let rows: Vec<Vec<f32>> = block.chunks(len).map(|r| r.to_vec()).collect();
+            per_well.append(PyArray2::from_vec2(py, &rows)?)?;
+        }
+        result.set_item("seed_paths", per_well)?;
+    }
     result.set_item("kept", out.kept)?;
     result.set_item("channels", out.channels)?;
     Ok(result)
