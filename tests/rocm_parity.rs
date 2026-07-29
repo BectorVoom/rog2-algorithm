@@ -71,6 +71,44 @@ fn hip_reruns_are_bit_identical() {
     assert_eq!(a.liks, b.liks, "log-likelihoods differ between runs");
 }
 
+/// ROCm's side of `tests/wgpu_parity.rs::wgpu_rarely_diverges_from_reference_across_seeds`
+/// — see that test's doc for why divergence *rate* over a seed sweep is the
+/// right thing to measure, not trajectory distance. Same sweep, same
+/// threshold: 13/192 seeds diverged before `kernel::ln_precise`, `sqrt_precise`
+/// and `recip_precise` replaced the hardware `ln`/`sqrt`/`/` in the Box-Muller
+/// radius and weight-normalisation path; 6/192 do now.
+#[cfg(feature = "hip")]
+#[test]
+fn hip_rarely_diverges_from_reference_across_seeds() {
+    use rog2_pf::synthetic::synthetic_well;
+
+    let mut diverged = 0usize;
+    let mut total = 0usize;
+    for well_seed in 1..=8u32 {
+        let w = vec![synthetic_well(well_seed, 60).0];
+        for n_particles in [128u32, 256, 500] {
+            let sweep_cfg = PfConfig {
+                n_particles,
+                n_seeds: 8,
+                cube_dim: 64,
+                ..PfConfig::default()
+            };
+            let gpu = run_on(Backend::Hip, &w, &sweep_cfg, &SCALES).expect("hip run");
+            let cpu = run_reference(&w, &sweep_cfg, &SCALES).expect("reference run");
+            for (a, b) in gpu.liks.iter().zip(&cpu.liks) {
+                total += 1;
+                if (a - b).abs() / a.abs().max(1.0) > 1e-4 {
+                    diverged += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        diverged * 10 <= total,
+        "{diverged}/{total} seeds diverged from the reference (previous fix: 13/192, now: 6/192)"
+    );
+}
+
 /// The beam search's real target: the HIP kernel's Viterbi backtrack (every
 /// step scatters survivor + parent slot into a global-memory history buffer,
 /// then one unit per cube walks it backward from the cheapest final slot —

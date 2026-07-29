@@ -35,6 +35,73 @@ fn exp_precise(x: f32) -> f32 {
     p * 2.0f32.powf(k)
 }
 
+/// Scalar twin of [`crate::kernel::ln_precise`] — see that function for why the
+/// Box-Muller radius cannot use the platform `ln`. Valid for `x` in `(0, 1]`.
+#[inline]
+fn ln_precise(x: f32) -> f32 {
+    let mut m = x;
+    let mut k = 0.0f32;
+    if m < 1.0 / 65536.0 {
+        m *= 65536.0;
+        k += 16.0;
+    }
+    if m < 1.0 / 256.0 {
+        m *= 256.0;
+        k += 8.0;
+    }
+    if m < 1.0 / 16.0 {
+        m *= 16.0;
+        k += 4.0;
+    }
+    if m < 0.25 {
+        m *= 4.0;
+        k += 2.0;
+    }
+    if m < 0.5 {
+        m *= 2.0;
+        k += 1.0;
+    }
+
+    let d = m + 1.0;
+    let z0 = 1.0 / d;
+    let z1 = z0 * (-d).mul_add(z0, 2.0);
+    let z2 = z1 * (-d).mul_add(z1, 2.0);
+    let s = (m - 1.0) * z2;
+    let u = s * s;
+    let mut p = 1.0f32 / 9.0;
+    p = p.mul_add(u, 1.0 / 7.0);
+    p = p.mul_add(u, 1.0 / 5.0);
+    p = p.mul_add(u, 1.0 / 3.0);
+    p = p.mul_add(u, 1.0);
+    let ln_m = 2.0 * (s * p);
+
+    (-k).mul_add(LN2, ln_m)
+}
+
+/// Scalar twin of [`crate::kernel::recip_precise`].
+#[inline]
+fn recip_precise(a: f32) -> f32 {
+    let z0 = 1.0 / a;
+    let z1 = z0 * (-a).mul_add(z0, 2.0);
+    z1 * (-a).mul_add(z1, 2.0)
+}
+
+/// Scalar twin of [`crate::kernel::sqrt_precise`] — see that function for why
+/// the Box-Muller radius cannot use the platform `sqrt` (fed by the platform
+/// `/`) directly.
+#[inline]
+fn sqrt_precise(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let z0 = 1.0 / x.sqrt();
+    let xz0 = x * z0;
+    let z1 = z0 * (-0.5f32).mul_add(xz0 * z0, 1.5);
+    let xz1 = x * z1;
+    let z2 = z1 * (-0.5f32).mul_add(xz1 * z1, 1.5);
+    x * z2
+}
+
 /// Scalar twins of [`crate::kernel::sin_precise`] / [`crate::kernel::cos_precise`],
 /// valid for the Box-Muller angle range `[0, 2*pi]`.
 #[inline]
@@ -84,7 +151,7 @@ fn hash32(a: u32, b: u32) -> u32 {
 /// kernel's `fma` exactly (see `kernel::pf_lik_kernel`).
 #[inline]
 fn normals(ctr: u32, k0: u32, k1: u32) -> (f32, f32, f32) {
-    let rad = (-2.0 * unit_f(hash32(ctr, k0)).ln()).sqrt();
+    let rad = sqrt_precise(-2.0 * ln_precise(unit_f(hash32(ctr, k0))));
     let ang = TWO_PI * unit_f(hash32(ctr, k1));
     let (sn, cs) = sin_cos_precise(ang);
     (rad, sn, cs)
@@ -250,11 +317,12 @@ pub fn run_single(wl: &WellInput, cfg: &PfConfig, seed: u32, preds: &mut [f32]) 
 
         let (ws, ws2, wt) = tree_sum3(&mut r0, &mut r1, &mut r2);
         log_lik += ws.ln();
-        let mut est = wt / ws;
-        let neff = if ws2 > 0.0 { ws * ws / ws2 } else { n_f };
+        let inv_ws = recip_precise(ws);
+        let mut est = wt * inv_ws;
+        let neff = if ws2 > 0.0 { ws * ws * recip_precise(ws2) } else { n_f };
 
         for wj in w.iter_mut() {
-            *wj /= ws;
+            *wj *= inv_ws;
         }
 
         if neff < cfg.resamp * n_f {
@@ -427,7 +495,7 @@ fn blend_into(preds: &[f32], wts: &[f32], len: usize, out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::exp_precise;
+    use super::{exp_precise, ln_precise, recip_precise, sqrt_precise};
 
     /// `exp_precise` has to stay comfortably inside 2 ULP over the range the
     /// likelihood can reach — `-0.5 * dd` down to `ln(lik_floor)`, about -27.6.
@@ -463,5 +531,62 @@ mod tests {
             assert!(v.is_finite() && v >= 0.0, "exp_precise({x}) = {v}");
             assert!(v <= 1.000_001, "exp_precise({x}) = {v} is not <= 1");
         }
+    }
+
+    /// `ln_precise` over `(0, 1]` — the whole range [`super::unit_f`] can
+    /// produce, including its smallest value `2^-24`, which exercises the
+    /// range reduction's largest `k`.
+    #[test]
+    fn ln_precise_is_accurate_over_the_unit_range() {
+        let mut worst_ulp = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for i in 1..=1_000_000u32 {
+            let x = i as f32 / 1_000_000.0;
+            let want = (x as f64).ln();
+            let ulp = ((ln_precise(x) as f64) - want).abs() / (want.abs().max(1.0) * 1.192_092_9e-7);
+            if ulp > worst_ulp {
+                worst_ulp = ulp;
+                worst_at = x;
+            }
+        }
+        assert!(worst_ulp < 15.0, "ln_precise is {worst_ulp:.2} ULP off at x = {worst_at}");
+        assert_eq!(ln_precise(1.0), 0.0, "ln_precise(1.0) must be exact");
+    }
+
+    /// `sqrt_precise` over the range `-2*ln(u)` can reach for `u` in `(0, 1]`.
+    #[test]
+    fn sqrt_precise_is_accurate_over_the_box_muller_radius_range() {
+        let mut worst_ulp = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for i in 0..1_000_000u32 {
+            let x = 34.0 * i as f32 / 1_000_000.0;
+            let want = (x as f64).sqrt();
+            let ulp = ((sqrt_precise(x) as f64) - want).abs() / (want.abs().max(1.0) * 1.192_092_9e-7);
+            if ulp > worst_ulp {
+                worst_ulp = ulp;
+                worst_at = x;
+            }
+        }
+        assert!(worst_ulp < 5.0, "sqrt_precise is {worst_ulp:.2} ULP off at x = {worst_at}");
+        assert_eq!(sqrt_precise(0.0), 0.0, "sqrt_precise(0.0) must be exact");
+    }
+
+    /// `recip_precise` over the wide magnitude range `ws`/`ws2` can take across
+    /// many resampling steps, not just an `O(1)` range.
+    #[test]
+    fn recip_precise_is_accurate_across_magnitudes() {
+        let mut worst_ulp = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for i in 1..=200_000u32 {
+            let exp = (i % 80) as i32 - 40;
+            let x = (i as f32 / 200_000.0) * 2f32.powi(exp);
+            let want = 1.0 / x as f64;
+            let ulp = ((recip_precise(x) as f64) - want).abs() / (want.abs().max(1.0) * 1.192_092_9e-7);
+            if ulp > worst_ulp {
+                worst_ulp = ulp;
+                worst_at = x;
+            }
+        }
+        assert!(worst_ulp < 5.0, "recip_precise is {worst_ulp:.2} ULP off at x = {worst_at}");
     }
 }

@@ -73,11 +73,18 @@ fn wgpu_matches_reference() {
 /// `lower_bound` boundary, that seed's trajectory separates from the reference
 /// and stays separated, so the useful measure is not how far a diverged seed
 /// drifts but *how often* a seed diverges at all. Sweeping 8 wells x 3 cloud
-/// sizes x 8 seeds, 95 of 192 seeds diverged before the weight path was made
+/// sizes x 8 seeds: 95 of 192 seeds diverged before the weight path was made
 /// backend-independent (`kernel::exp_precise`, `sin_precise`, `cos_precise`, the
-/// host-precomputed reciprocals and the explicit `fma`s); 13 do now, all of them
-/// traceable to `ln`/`sqrt` in the Box-Muller radius, which are still the
-/// hardware's. The bound here sits between the two.
+/// host-precomputed reciprocals and the explicit `fma`s); 13 after that, all
+/// traceable to `ln`/`sqrt` in the Box-Muller radius and the runtime `/`s
+/// normalising the weights; 9 now that those route through `kernel::ln_precise`,
+/// `sqrt_precise` and `recip_precise` instead. The remainder isn't a
+/// convergence-depth gap in those functions (confirmed bit-identical against
+/// the reference in isolation by `src/bin/probe.rs` / `probe2.rs`, and a third
+/// Newton iteration changes nothing) — it's wgpu's `/` itself occasionally
+/// landing further from correctly-rounded than refinement can erase; see
+/// `kernel.rs`'s module doc. The bound here sits between the two most recent
+/// numbers, not the original 95.
 #[test]
 fn wgpu_rarely_diverges_from_reference_across_seeds() {
     let mut diverged = 0usize;
@@ -102,8 +109,8 @@ fn wgpu_rarely_diverges_from_reference_across_seeds() {
         }
     }
     assert!(
-        diverged * 5 <= total,
-        "{diverged}/{total} seeds diverged from the reference (pre-fix: 95/192, fixed: 13/192)"
+        diverged * 10 <= total,
+        "{diverged}/{total} seeds diverged from the reference (pre-fix: 95/192, previous fix: 13/192, now: 9/192)"
     );
 }
 

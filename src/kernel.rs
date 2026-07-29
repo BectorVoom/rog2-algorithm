@@ -61,10 +61,37 @@
 //!   in the weight path is written as an explicit [`fma`]. SPIR-V division is
 //!   not correctly rounded either, so `1 / step` and `1 / gs` are computed on
 //!   the host (see [`crate::batch::FlatBatch::build`]) and multiplied here.
+//! * **`ln` / `sqrt` in the Box-Muller radius, and the runtime `/`s in the
+//!   weight path.** These used to be the last disagreement wgpu/ROCm had with
+//!   the CPU reference (13/192 seeds in `tests/wgpu_parity.rs`'s sweep, an
+//!   identical 13/192 on ROCm). [`ln_precise`] replaces the hardware `ln` with
+//!   an exact power-of-two range reduction (comparisons and multiplies by
+//!   powers of two are exact in IEEE 754, not approximations) plus a Taylor
+//!   series, so it never calls the hardware transcendental at all.
+//!   [`sqrt_precise`] and [`recip_precise`] instead seed a Newton-Raphson
+//!   refinement from one hardware `sqrt` / `/`; the refinement itself only
+//!   multiplies and `fma`s (confirmed bit-identical on every backend here —
+//!   see `src/bin/probe3.rs`), and each iteration squares the seed's
+//!   backend-specific error, driving it far below one ULP of `f32` for the
+//!   large majority of inputs regardless of which backend produced the seed.
+//!   [`recip_precise`] closes the same gap for `w / ws`, `wt / ws` and
+//!   `ws^2 / ws2` in [`pf_lik_kernel`] — runtime, per-step values a host
+//!   precompute can't reach, and `ws^2 / ws2` in particular gates *whether*
+//!   resampling runs at all this step, a binary decision at least as sensitive
+//!   to a rounding wobble as `lower_bound` itself.
 //!
-//! What is left is `ln` and `sqrt` in the Box-Muller radius, still the
-//! hardware's at ~1.3 and ~0.7 ULP; they are what remains of the wgpu-vs-CPU
-//! disagreement measured by `tests/wgpu_parity.rs`.
+//!   None of this reaches zero disagreement. wgpu's `/`, measured directly
+//!   (`src/bin/probe2.rs`), is occasionally off by more than the "a few ULP"
+//!   SPIR-V nominally allows, and on the rare input where the true quotient
+//!   sits close to a rounding boundary, that larger seed error survives
+//!   Newton refinement as a same-magnitude 1-ULP disagreement in the
+//!   converged result — running a third iteration changes nothing, confirming
+//!   it is not a convergence-depth problem. Measured on the same sweep: wgpu's
+//!   13/192 fell to 9/192, ROCm's 13/192 fell to 6/192. Eliminating that
+//!   residual for good would mean seeding from a bit-manipulation reciprocal
+//!   (no hardware `/` anywhere, at the cost of a generic `FloatBits` bound)
+//!   rather than refining one; not done here because the return no longer
+//!   justifies that bound spreading through every caller in this file.
 
 use cubecl::prelude::*;
 
@@ -166,6 +193,115 @@ pub fn exp_precise<F: Float>(x: F) -> F {
     // with a base of two lowers to `exp2(k * log2 2)` — an exact scaling — on
     // every backend here.
     p * F::powf(F::new(2.0f32), k)
+}
+
+/// `ln(x)` for `x` in `(0, 1]` — the only range [`unit_f`] can produce — bit-
+/// identical on every backend because it never calls the hardware `ln`.
+///
+/// Range reduction writes `x = m * 2^-k` with `m` in `[0.5, 1]`, found by a
+/// cascade of "double `m` and count it in `k`" steps gated on exact powers of
+/// two. Doubling by an exact power of two only shifts the exponent field, so
+/// unlike [`exp_precise`]'s argument reduction this step carries zero
+/// rounding error, not just a bounded one, and needs no compensation term.
+///
+/// `ln(m)` then comes from the identity `ln(m) = 2*atanh(s)`, `s = (m-1)/(m+1)`:
+/// over `m` in `[0.5, 1]`, `s` stays in `[-1/3, 0]`, so the series
+/// `s + s^3/3 + s^5/5 + s^7/7 + s^9/9` (truncation error under 2e-9) converges
+/// fast; the reciprocal that produces `s` is itself [`recip_precise`], so nothing
+/// here calls the hardware `/` either. `ln(x) = ln(m) - k*ln 2`, folded through
+/// one final `fma` for the same reason [`exp_precise`] uses one. End to end this
+/// is within ~11 ULP of the true `ln`, worse than the series' own truncation
+/// bound because the reciprocal refinement and the range reduction both add
+/// their own rounding — the goal, as with [`exp_precise`], is the same answer
+/// on every backend, not a better one than libm.
+#[cube]
+pub fn ln_precise<F: Float>(x: F) -> F {
+    let mut m = x;
+    let mut k = F::new(0.0f32);
+    if m < F::new(1.0f32 / 65536.0) {
+        m *= F::new(65536.0f32);
+        k += F::new(16.0f32);
+    }
+    if m < F::new(1.0f32 / 256.0) {
+        m *= F::new(256.0f32);
+        k += F::new(8.0f32);
+    }
+    if m < F::new(1.0f32 / 16.0) {
+        m *= F::new(16.0f32);
+        k += F::new(4.0f32);
+    }
+    if m < F::new(0.25f32) {
+        m *= F::new(4.0f32);
+        k += F::new(2.0f32);
+    }
+    if m < F::new(0.5f32) {
+        m *= F::new(2.0f32);
+        k += F::new(1.0f32);
+    }
+
+    // `s = (m - 1) / (m + 1)` without a device division: wgpu's `/` is not
+    // correctly rounded (same reason `sqrt_precise` seeds from one instead of
+    // using it directly), so the reciprocal of `m + 1` is refined by the same
+    // division-free Newton iteration, `z <- z * (2 - d*z)`, which halves the
+    // error's *exponent* every step and so washes out the seed's rounding
+    // before it can reach `s`.
+    let d = m + F::new(1.0f32);
+    let z0 = F::new(1.0f32) / d;
+    let z1 = z0 * fma(-d, z0, F::new(2.0f32));
+    let z2 = z1 * fma(-d, z1, F::new(2.0f32));
+    let s = (m - F::new(1.0f32)) * z2;
+    let u = s * s;
+    let mut p = F::new(1.0f32 / 9.0);
+    p = fma(p, u, F::new(1.0f32 / 7.0));
+    p = fma(p, u, F::new(1.0f32 / 5.0));
+    p = fma(p, u, F::new(1.0f32 / 3.0));
+    p = fma(p, u, F::new(1.0f32));
+    let ln_m = F::new(2.0f32) * (s * p);
+
+    fma(-k, F::new(LN2), ln_m)
+}
+
+/// `sqrt(x)` for `x >= 0`, bit-identical on every backend regardless of how
+/// the hardware `sqrt` and `/` behind the seed round.
+///
+/// Seeds a reciprocal-square-root estimate from the hardware `sqrt` and one
+/// division (both merely close, not identical, across backends: `sqrt` is
+/// ~0.7 ULP, wgpu's `/` is not correctly rounded), then runs the classic
+/// division-free Newton iteration `z <- z * (1.5 - 0.5*x*z^2)` twice. That
+/// iteration only multiplies and `fma`s — both correctly rounded everywhere —
+/// and squares the *relative* error every step: a seed wrong by a few ULP
+/// (~1e-6) lands the first iterate wrong by ~1e-12, already below `f32`'s
+/// rounding quantum, so the result stops depending on which backend produced
+/// the seed. The second iteration is margin. `x * z` recovers `sqrt(x)`.
+/// `1/a`, bit-identical on every backend regardless of how the hardware `/`
+/// that seeds it rounds.
+///
+/// Same division-free Newton iteration as the reciprocal inside
+/// [`ln_precise`], pulled out because the weight-normalisation path
+/// (`w / ws`, `wt / ws`, `ws*ws / ws2`) needs it too: those are runtime,
+/// per-step values a host precompute can't reach, and `ws^2/ws2` in
+/// particular gates *whether* systematic resampling runs at all this step —
+/// a binary decision at least as sensitive to a rounding wobble as the
+/// `lower_bound` search resampling itself does.
+#[cube]
+pub fn recip_precise<F: Float>(a: F) -> F {
+    let z0 = F::new(1.0f32) / a;
+    let z1 = z0 * fma(-a, z0, F::new(2.0f32));
+    z1 * fma(-a, z1, F::new(2.0f32))
+}
+
+#[cube]
+pub fn sqrt_precise<F: Float>(x: F) -> F {
+    let mut out = F::new(0.0f32);
+    if x > F::new(0.0f32) {
+        let z0 = F::new(1.0f32) / F::sqrt(x);
+        let xz0 = x * z0;
+        let z1 = z0 * fma(F::new(-0.5f32), xz0 * z0, F::new(1.5f32));
+        let xz1 = x * z1;
+        let z2 = z1 * fma(F::new(-0.5f32), xz1 * z1, F::new(1.5f32));
+        out = x * z2;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +650,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
         let mut j = start;
         while j < end {
             let base = hash32(stream, j as u32);
-            let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(base, 0u32)).ln()).sqrt();
+            let rad = sqrt_precise::<F>(F::new(-2.0f32) * ln_precise::<F>(unit_f::<F>(hash32(base, 0u32))));
             let ang = F::new(TWO_PI) * unit_f::<F>(hash32(base, 1u32));
             pos[j] = fma(spr * rad, cos_precise::<F>(ang), ls);
             rate[j] = fma(F::new(0.01f32) * rad, sin_precise::<F>(ang), ir);
@@ -551,7 +687,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 let ctr = hash32(hash32(stream, p as u32), step_key);
                 let u1 = unit_f::<F>(hash32(ctr, 0u32));
                 let u2 = unit_f::<F>(hash32(ctr, 1u32));
-                let rad = (F::new(-2.0f32) * u1.ln()).sqrt();
+                let rad = sqrt_precise::<F>(F::new(-2.0f32) * ln_precise::<F>(u1));
                 let ang = F::new(TWO_PI) * u2;
 
                 let rj = fma(vn * rad, cos_precise::<F>(ang), mom * rate[p]);
@@ -590,19 +726,20 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
             let wt = red[2 * cube_dim];
 
             log_lik += ws.ln();
-            let mut est = wt / ws;
+            let inv_ws = recip_precise::<F>(ws);
+            let mut est = wt * inv_ws;
 
             // Effective sample size of the *normalised* weights:
             // sum((w/ws)^2) = ws2 / ws^2, so neff = ws^2 / ws2.
             let mut neff = n_f;
             if ws2 > F::new(0.0f32) {
-                neff = ws * ws / ws2;
+                neff = ws * ws * recip_precise::<F>(ws2);
             }
 
             // ---- normalise ------------------------------------------------
             let mut q = start;
             while q < end {
-                w[q] = w[q] / ws;
+                w[q] = w[q] * inv_ws;
                 q += 1;
             }
 
@@ -627,7 +764,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 while b < end {
                     let ci = u32::cast_from(w[b]) as usize;
                     let rctr = hash32(hash32(stream, b as u32), step_key);
-                    let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(rctr, 2u32)).ln()).sqrt();
+                    let rad = sqrt_precise::<F>(F::new(-2.0f32) * ln_precise::<F>(unit_f::<F>(hash32(rctr, 2u32))));
                     let ang = F::new(TWO_PI) * unit_f::<F>(hash32(rctr, 3u32));
                     cum[b] = fma(rough_p * rad, cos_precise::<F>(ang), pos[ci]);
                     b += 1;
@@ -649,7 +786,7 @@ pub fn pf_lik_kernel<F: Float + CubeElement>(
                 while e < end {
                     let ci = u32::cast_from(w[e]) as usize;
                     let rctr = hash32(hash32(stream, e as u32), step_key);
-                    let rad = (F::new(-2.0f32) * unit_f::<F>(hash32(rctr, 2u32)).ln()).sqrt();
+                    let rad = sqrt_precise::<F>(F::new(-2.0f32) * ln_precise::<F>(unit_f::<F>(hash32(rctr, 2u32))));
                     let ang = F::new(TWO_PI) * unit_f::<F>(hash32(rctr, 3u32));
                     cum[e] = fma(rough_r * rad, sin_precise::<F>(ang), rate[ci]);
                     e += 1;
