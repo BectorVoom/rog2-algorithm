@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "rog2-algorithm"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "bytemuck",

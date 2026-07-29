@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rog2-algorithm"
-version = "0.2.4"
+version = "0.2.5"
 description = "GPU particle filter (CubeCL/CUDA/ROCm/wgpu) for the ROGII wellbore geology competition"
 readme = "README.md"
 requires-python = ">=3.9"
