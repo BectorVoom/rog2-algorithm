@@ -123,7 +123,7 @@ BUILD = WORK / "rog2-algorithm"
 # Look for pre-built wheel in /kaggle/input or local dist/ first (supports offline execution)
 prebuilt_wheels = []
 if Path("/kaggle/input").exists():
-    prebuilt_wheels = sorted(Path("/kaggle/input").glob("*/**/rog2_pf*.whl"))
+    prebuilt_wheels = sorted(Path("/kaggle/input").glob("*/**/rog2_*.whl"))
 if not prebuilt_wheels and Path("dist").exists():
     prebuilt_wheels = sorted(Path("dist").glob("*.whl"))
 

@@ -39,12 +39,18 @@ mkdir -p "$WORK"
 for item in Cargo.toml pyproject.toml README.md src python tests; do
   [ -e "$CRATE/$item" ] && cp -r "$CRATE/$item" "$WORK/"
 done
-if [ -d "$CRATE/dist" ] && ls "$CRATE"/dist/*.whl >/dev/null 2>&1; then
-  mkdir -p "$WORK/dist"
-  cp "$CRATE"/dist/*.whl "$WORK/dist/"
-fi
 tar -czf "$STAGE/rog2-src.tar.gz" -C "$STAGE/pack" rog2-algorithm
 rm -rf "$STAGE/pack"
+
+# Wheels go in at the dataset's *top level*, not inside the tarball: that is the
+# only form a notebook can `pip install` straight from /kaggle/input without
+# unpacking, which is what makes an internet-off kernel possible. Newest version
+# only — Kaggle datasets keep every file of every version otherwise.
+if [ -d "$CRATE/dist" ] && ls "$CRATE"/dist/*.whl >/dev/null 2>&1; then
+  NEWEST_VER="$(ls "$CRATE"/dist/*.whl | sed -n 's/.*rog2_algorithm-\([0-9.]*\)-.*/\1/p' | sort -V | tail -1)"
+  cp "$CRATE"/dist/rog2_algorithm-"$NEWEST_VER"-*.whl "$STAGE/"
+  echo "staged wheels: $(cd "$STAGE" && ls *.whl | tr '\n' ' ')"
+fi
 
 cat > "$STAGE/dataset-metadata.json" <<JSON
 {
