@@ -25,18 +25,18 @@ def code(text: str) -> None:
 
 md(
     r"""
-# ROGII particle filter on a T4 — CubeCL/CUDA port
+# ROGII particle filter — CubeCL GPU & CPU port
 
-This notebook builds `rog2-pf` (the Rust/CubeCL port of the notebook's 128-seed
-likelihood-weighted particle filter) against CUDA, then **verifies** and
-**benchmarks** it against the original numba `_pf_lik_allseeds`.
+This notebook builds or installs `rog2-pf` (the Rust/CubeCL port of the notebook's 128-seed
+likelihood-weighted particle filter) for **GPU (CUDA/wgpu)** or **CPU** (including **manylinux** environments),
+then **verifies** and **benchmarks** it against the original numba `_pf_lik_allseeds`.
 
-Requirements: **GPU T4 accelerator**, **internet ON** (for `rustup` and crates.io),
-and the competition data attached.
+Requirements: **GPU accelerator (optional, automatically used if available)** or **CPU**,
+**internet ON** (for `rustup` and crates.io if building from source; **internet OFF** supported if a prebuilt wheel is attached), and the competition data attached.
 
 ## What is being compared
 
-The GPU port is not a bit-for-bit clone of the numba kernel — it cannot be. numba
+The CubeCL port is not a bit-for-bit clone of the numba kernel — it cannot be. numba
 draws from a single Mersenne Twister stream that particles consume *in order*,
 which is inherently serial. The port uses a counter-based RNG keyed by
 `(seed, particle slot, step)`, so it is reproducible across runs and devices but
@@ -46,7 +46,7 @@ Two independent Monte Carlo estimators of the same posterior therefore should no
 match row-by-row; they should agree *statistically*. So this notebook checks:
 
 1. **Accuracy** — RMSE against the true TVT on train wells. This is the number
-   that matters; the GPU path must be as accurate as numba, not identical to it.
+   that matters; the CubeCL path must be as accurate as numba, not identical to it.
 2. **Agreement** — RMSE between the two trajectories, which should be small next
    to the spread across seeds (`pf_pt_std`).
 3. **Throughput** — wall-clock for the same work.
@@ -66,19 +66,20 @@ def sh(cmd, **kw):
         print(r.stderr[-4000:])
     return r
 
-sh("nvidia-smi")
-sh("nvcc --version || ls /usr/local | grep -i cuda")
+r_gpu = sh("nvidia-smi")
+has_gpu = (r_gpu.returncode == 0)
+print(f"GPU Accelerator detected: {has_gpu}")
+sh("nvcc --version || ls /usr/local | grep -i cuda || true")
 print("python", sys.version)
 """
 )
 
 md(
     r"""
-## 1. Toolchain
+## 1. Toolchain & Environment
 
-`cubecl-cuda` compiles kernels at runtime through NVRTC, but its build script
-reads the CUDA version from the toolkit, so `nvcc` must be on `PATH` at build
-time. Kaggle's GPU image ships it under `/usr/local/cuda`.
+When building CUDA kernels at runtime through NVRTC, `nvcc` is placed on `PATH`.
+If a prebuilt wheel (e.g. manylinux wheel) is attached in dataset inputs, it will be installed directly without compilation.
 """
 )
 
@@ -86,20 +87,14 @@ code(
     r"""
 os.environ["PATH"] = "/usr/local/cuda/bin:" + os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"]
 os.environ.setdefault("CUDA_ROOT", "/usr/local/cuda")
-
-if subprocess.run("cargo --version", shell=True, capture_output=True).returncode != 0:
-    sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable")
-sh("cargo --version && rustc --version")
-sh("pip install -q 'maturin>=1.7,<2.0'")
 """
 )
 
 md(
     r"""
-## 2. Locate the crate and build the wheel
+## 2. Locate wheel or crate source, and install
 
-The crate is expected as a Kaggle dataset (`kaggle/push.sh` in the repo uploads
-it) or, when running locally, straight from the repo.
+Looks for a prebuilt `.whl` (manylinux / abi3) in `/kaggle/input` or `dist/` first. If absent, builds from source via `maturin` with feature fallbacks matching CPU/GPU hardware.
 """
 )
 
@@ -108,57 +103,80 @@ code(
 WORK = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
 BUILD = WORK / "rog2-algorithm"
 
-# The crate is uploaded as a tarball; Kaggle extracts dataset archives on ingest,
-# so accept either shape. cargo needs a writable tree, so always work on a copy
-# in /kaggle/working.
-SRC = None
+# Look for pre-built wheel in /kaggle/input or local dist/ first (supports offline execution)
+prebuilt_wheels = []
 if Path("/kaggle/input").exists():
-    print("inputs:", [str(p) for p in Path("/kaggle/input").iterdir()])
-    hits = sorted(Path("/kaggle/input").glob("*/**/Cargo.toml"))
-    if hits:
-        SRC = hits[0].parent
-    else:
-        tars = sorted(Path("/kaggle/input").glob("*/**/rog2-src.tar.gz"))
-        assert tars, "attach the rog2-pf-src dataset to this notebook"
-        sh(f"rm -rf '{BUILD}' && tar -xzf '{tars[0]}' -C '{WORK}'")
-if SRC is None and not (BUILD / "Cargo.toml").exists():
-    # Running from a checkout of the repo.
-    SRC = next((p for p in [Path("rog2-algorithm"), Path(".")] if (p / "Cargo.toml").exists()), None)
+    prebuilt_wheels = sorted(Path("/kaggle/input").glob("*/**/rog2_pf*.whl"))
+if not prebuilt_wheels and Path("dist").exists():
+    prebuilt_wheels = sorted(Path("dist").glob("*.whl"))
 
-if SRC is not None:
-    print("crate source:", SRC)
-    sh(f"rm -rf '{BUILD}' && cp -r '{SRC}' '{BUILD}'")
+wheel = None
+if prebuilt_wheels:
+    wheel = prebuilt_wheels[-1]
+    print(f"Found pre-built wheel: {wheel}")
+else:
+    SRC = None
+    if Path("/kaggle/input").exists():
+        print("inputs:", [str(p) for p in Path("/kaggle/input").iterdir()])
+        hits = sorted(Path("/kaggle/input").glob("*/**/Cargo.toml"))
+        if hits:
+            SRC = hits[0].parent
+        else:
+            tars = sorted(Path("/kaggle/input").glob("*/**/rog2-src.tar.gz"))
+            if tars:
+                sh(f"rm -rf '{BUILD}' && tar -xzf '{tars[0]}' -C '{WORK}'")
+    if SRC is None and not (BUILD / "Cargo.toml").exists():
+        SRC = next((p for p in [Path("rog2-algorithm"), Path(".")] if (p / "Cargo.toml").exists()), None)
 
-assert (BUILD / "Cargo.toml").exists(), f"{BUILD} is not a crate"
-print("build dir:", BUILD.resolve())
+    if SRC is not None:
+        print("crate source:", SRC)
+        sh(f"rm -rf '{BUILD}' && cp -r '{SRC}' '{BUILD}'")
+
+    assert (BUILD / "Cargo.toml").exists(), "No prebuilt wheel or crate source found"
+    print("build dir:", BUILD.resolve())
 """
 )
 
 code(
     r"""
-t0 = time.time()
-r = sh(
-    "maturin build --release --no-default-features "
-    "--features 'pyo3/extension-module,python,cuda' -o dist",
-    cwd=str(BUILD),
-)
-print(f"build took {time.time()-t0:.0f}s, rc={r.returncode}")
-assert r.returncode == 0, "maturin build failed — see stderr above"
-"""
-)
+if wheel is None:
+    if subprocess.run("cargo --version", shell=True, capture_output=True).returncode != 0:
+        sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable")
+    sh("cargo --version && rustc --version")
+    sh("pip install -q 'maturin>=1.7,<2.0'")
 
-code(
-    r"""
-import glob
-wheel = sorted(glob.glob(str(BUILD / "dist" / "*.whl")))[-1]
-print("wheel:", wheel)
+    feature_combos = []
+    if has_gpu:
+        feature_combos.append("pyo3/extension-module,python,cuda,wgpu,cpu")
+    feature_combos.extend([
+        "pyo3/extension-module,python,wgpu,cpu",
+        "pyo3/extension-module,python,cpu"
+    ])
+
+    t0 = time.time()
+    built = False
+    for feats in feature_combos:
+        print(f"Attempting build with features: '{feats}'")
+        r = sh(f"maturin build --release --no-default-features --features '{feats}' -o dist", cwd=str(BUILD))
+        if r.returncode == 0:
+            built = True
+            break
+    print(f"build took {time.time()-t0:.0f}s")
+    assert built, "maturin build failed for all feature combinations"
+
+    import glob
+    wheel = sorted(glob.glob(str(BUILD / "dist" / "*.whl")))[-1]
+
+print("installing wheel:", wheel)
 sh(f"pip install --force-reinstall --no-deps -q '{wheel}'")
 
 import importlib
 import rog2_pf
 importlib.reload(rog2_pf)
-print("rog2_pf", rog2_pf.__version__, "backends:", rog2_pf.available_backends())
-assert "cuda" in rog2_pf.available_backends(), "CUDA backend missing from this build"
+backends = rog2_pf.available_backends()
+print("rog2_pf", rog2_pf.__version__, "backends:", backends)
+assert len(backends) > 0, "No backends available in this build"
+BACKEND = "auto"
 """
 )
 
@@ -332,19 +350,19 @@ md(
 
 code(
     r"""
-# CubeCL compiles the kernel through NVRTC on first use. That is a one-off cost
+# CubeCL compiles the kernel on first use. That is a one-off cost
 # per process, so time it separately instead of charging it to the batch.
 t0 = time.time()
 lik_pf_batch([pairs[keep[0]]], n_particles=N_PARTICLES, n_seeds=N_SEEDS,
-             scales=SCALES, backend="cuda")
+             scales=SCALES, backend=BACKEND)
 jit_time = time.time() - t0
-print(f"first call (NVRTC compile + one well): {jit_time:.2f} s")
+print(f"first call (warmup / JIT + one well): {jit_time:.2f} s")
 
 t0 = time.time()
 gpu = lik_pf_batch([pairs[i] for i in keep], n_particles=N_PARTICLES, n_seeds=N_SEEDS,
-                   scales=SCALES, backend="cuda", with_quality=True)
+                   scales=SCALES, backend=BACKEND, with_quality=True)
 gpu_time = time.time() - t0
-print(f"GPU (CubeCL/CUDA, warm): {gpu_time:.2f} s for {len(keep)} wells")
+print(f"CubeCL ({BACKEND}, warm): {gpu_time:.2f} s for {len(keep)} wells")
 
 t0 = time.time()
 cpu = [numba_lik_pf(prepared[i], N_PARTICLES, N_SEEDS, SCALES) for i in keep]
@@ -354,7 +372,7 @@ print(f"speedup: {cpu_time/gpu_time:.1f}x")
 
 steps = sum(len(prepared[i]["md"]) for i in keep) * N_PARTICLES * N_SEEDS
 print(f"work: {steps/1e9:.2f} G particle-steps -> "
-      f"GPU {steps/gpu_time/1e9:.2f} G/s, numba {steps/cpu_time/1e9:.3f} G/s")
+      f"CubeCL {steps/gpu_time/1e9:.2f} G/s, numba {steps/cpu_time/1e9:.3f} G/s")
 """
 )
 
@@ -414,7 +432,7 @@ if "gpu_vs_truth" in report:
     c = np.sqrt((report.numba_vs_truth**2 * report.rows).sum() / report.rows.sum())
     SUMMARY["pooled_rmse_gpu_ft"] = round(float(g), 4)
     SUMMARY["pooled_rmse_numba_ft"] = round(float(c), 4)
-    print(f"\npooled RMSE vs true TVT: GPU {g:.3f} ft, numba {c:.3f} ft "
+    print(f"\npooled RMSE vs true TVT: CubeCL {g:.3f} ft, numba {c:.3f} ft "
           f"({100*(g-c)/c:+.1f}%)")
     print("\nRow-by-row equality is NOT expected: different RNG streams. Read the "
           "pooled RMSEs as 'same accuracy to within Monte Carlo noise' — with a "
@@ -429,7 +447,7 @@ md(
     r"""
 ## 7. Determinism
 
-Re-running the GPU path with the same inputs must reproduce the previous result
+Re-running the CubeCL path with the same inputs must reproduce the previous result
 bit for bit — the counter-based RNG has no state and the reduction order is fixed
 by `cube_dim`.
 """
@@ -438,7 +456,7 @@ by `cube_dim`.
 code(
     r"""
 again = lik_pf_batch([pairs[i] for i in keep[:4]], n_particles=N_PARTICLES,
-                     n_seeds=N_SEEDS, scales=SCALES, backend="cuda")
+                     n_seeds=N_SEEDS, scales=SCALES, backend=BACKEND)
 ok = all(np.array_equal(again[s][0]["pf_scale_3"], gpu[s][0]["pf_scale_3"])
          for s in range(len(again)))
 print("bitwise reproducible:", ok)
@@ -451,7 +469,7 @@ md(
     r"""
 ## 8. Scaling
 
-Throughput against batch size — a single well cannot fill a T4, which is why the
+Throughput against batch size — a single well cannot fill a GPU or multi-core CPU, which is why the
 API is batched.
 """
 )
@@ -463,7 +481,7 @@ scaling = []
 for b in sizes:
     sub = [pairs[i] for i in keep[:b]]
     t0 = time.time()
-    lik_pf_batch(sub, n_particles=N_PARTICLES, n_seeds=N_SEEDS, scales=SCALES, backend="cuda")
+    lik_pf_batch(sub, n_particles=N_PARTICLES, n_seeds=N_SEEDS, scales=SCALES, backend=BACKEND)
     dt = time.time() - t0
     s = sum(len(prepared[i]["md"]) for i in keep[:b]) * N_PARTICLES * N_SEEDS
     scaling.append({"wells": b, "seconds": round(dt, 3),

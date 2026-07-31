@@ -28,7 +28,7 @@ jobs:
           maturin-version: latest
           command: build
           args: >
-            --release --no-default-features
+            --release --manylinux auto --no-default-features
             --features '${{ env.MATURIN_FEATURES }},${{ inputs.features || 'cpu' }}'
             -o dist
       - uses: actions/upload-artifact@v4
@@ -48,7 +48,7 @@ jobs:
           maturin-version: latest
           command: build
           args: >
-            --release --no-default-features
+            --release --manylinux auto --no-default-features
             --features 'pyo3/extension-module,python,cuda,wgpu,cpu'
             -o dist
       - uses: actions/upload-artifact@v4
@@ -85,7 +85,7 @@ jobs:
           maturin-version: latest
           command: build
           args: >
-            --release --no-default-features
+            --release --manylinux auto --no-default-features
             --features 'pyo3/extension-module,python,hip'
             -o dist
       - uses: actions/upload-artifact@v4

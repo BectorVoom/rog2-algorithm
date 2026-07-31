@@ -25,20 +25,20 @@ def code(text: str) -> None:
 
 md(
     r"""
-# ROGII beam search on a T4 — CubeCL/CUDA port
+# ROGII beam search — CubeCL GPU & CPU port
 
-This notebook builds `rog2-pf` (the Rust/CubeCL port) against CUDA, then
-**verifies** and **benchmarks** its beam-search ensemble against the original
+This notebook builds or installs `rog2-pf` (the Rust/CubeCL port) for **GPU (CUDA/wgpu)** or **CPU** (including **manylinux** environments),
+then **verifies** and **benchmarks** its beam-search ensemble against the original
 numpy `beam_search` / `run_beam_ensemble` from
 `notebook/rogii-another-approch-2nd.ipynb` (cell 12).
 
-Requirements: **GPU T4 accelerator**, **internet ON** (for `rustup` and crates.io),
-and the competition data attached.
+Requirements: **GPU accelerator (optional, automatically used if available)** or **CPU**,
+**internet ON** (for `rustup` and crates.io if building from source; **internet OFF** supported if a prebuilt wheel is attached), and the competition data attached.
 
 ## What is being compared
 
 Unlike the particle filter, the beam search is **deterministic** — no RNG
-anywhere. The GPU port should therefore reproduce numpy essentially exactly, and
+anywhere. The CubeCL port should therefore reproduce numpy essentially exactly, and
 this notebook holds it to that standard rather than to a statistical one.
 
 The trajectory a config emits is `tw_tvt[best_index]`: a lookup into the
@@ -49,7 +49,7 @@ the same sample rounded differently (the kernel works in f32, numpy in f64).
 
 The checks below are:
 
-1. **Sample agreement** — the fraction of rows where the GPU and numpy chose the
+1. **Sample agreement** — the fraction of rows where CubeCL and numpy chose the
    same type-well sample, per config. Expect 100%, or a handful of rows off where
    two paths were within f32 rounding of a tie.
 2. **Ensemble RMSE** — between the two 14-config means, in feet.
@@ -64,7 +64,7 @@ The checks below are:
 `beam_search` is `for config: for step: <numpy op over 5 x bs candidates>`. The
 step loop is a dynamic program and cannot be parallelised, but the config and
 well axes are fully independent, so every `(well, config)` pair becomes one cube
-(CUDA block). With 14 configs and a few hundred wells that is thousands of
+(CUDA block / threadgroup). With 14 configs and a few hundred wells that is thousands of
 independent cubes from a single launch, and each cube's `5 * bs <= 150`
 candidates map onto its units.
 """
@@ -83,19 +83,20 @@ def sh(cmd, **kw):
         print(r.stderr[-4000:])
     return r
 
-sh("nvidia-smi")
-sh("nvcc --version || ls /usr/local | grep -i cuda")
+r_gpu = sh("nvidia-smi")
+has_gpu = (r_gpu.returncode == 0)
+print(f"GPU Accelerator detected: {has_gpu}")
+sh("nvcc --version || ls /usr/local | grep -i cuda || true")
 print("python", sys.version)
 """
 )
 
 md(
     r"""
-## 1. Toolchain
+## 1. Toolchain & Environment
 
-`cubecl-cuda` compiles kernels at runtime through NVRTC, but its build script
-reads the CUDA version from the toolkit, so `nvcc` must be on `PATH` at build
-time. Kaggle's GPU image ships it under `/usr/local/cuda`.
+When building CUDA kernels at runtime through NVRTC, `nvcc` is placed on `PATH`.
+If a prebuilt wheel (e.g. manylinux wheel) is attached in dataset inputs, it will be installed directly without compilation.
 """
 )
 
@@ -103,20 +104,14 @@ code(
     r"""
 os.environ["PATH"] = "/usr/local/cuda/bin:" + os.path.expanduser("~/.cargo/bin") + ":" + os.environ["PATH"]
 os.environ.setdefault("CUDA_ROOT", "/usr/local/cuda")
-
-if subprocess.run("cargo --version", shell=True, capture_output=True).returncode != 0:
-    sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable")
-sh("cargo --version && rustc --version")
-sh("pip install -q 'maturin>=1.7,<2.0'")
 """
 )
 
 md(
     r"""
-## 2. Locate the crate and build the wheel
+## 2. Locate wheel or crate source, and install
 
-The crate is expected as a Kaggle dataset (`kaggle/push.sh` in the repo uploads
-it) or, when running locally, straight from the repo.
+Looks for a prebuilt `.whl` (manylinux / abi3) in `/kaggle/input` or `dist/` first. If absent, builds from source via `maturin` with feature fallbacks matching CPU/GPU hardware.
 """
 )
 
@@ -125,57 +120,80 @@ code(
 WORK = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
 BUILD = WORK / "rog2-algorithm"
 
-# The crate is uploaded as a tarball; Kaggle extracts dataset archives on ingest,
-# so accept either shape. cargo needs a writable tree, so always work on a copy
-# in /kaggle/working.
-SRC = None
+# Look for pre-built wheel in /kaggle/input or local dist/ first (supports offline execution)
+prebuilt_wheels = []
 if Path("/kaggle/input").exists():
-    print("inputs:", [str(p) for p in Path("/kaggle/input").iterdir()])
-    hits = sorted(Path("/kaggle/input").glob("*/**/Cargo.toml"))
-    if hits:
-        SRC = hits[0].parent
-    else:
-        tars = sorted(Path("/kaggle/input").glob("*/**/rog2-src.tar.gz"))
-        assert tars, "attach the rog2-pf-src dataset to this notebook"
-        sh(f"rm -rf '{BUILD}' && tar -xzf '{tars[0]}' -C '{WORK}'")
-if SRC is None and not (BUILD / "Cargo.toml").exists():
-    # Running from a checkout of the repo.
-    SRC = next((p for p in [Path("rog2-algorithm"), Path(".")] if (p / "Cargo.toml").exists()), None)
+    prebuilt_wheels = sorted(Path("/kaggle/input").glob("*/**/rog2_pf*.whl"))
+if not prebuilt_wheels and Path("dist").exists():
+    prebuilt_wheels = sorted(Path("dist").glob("*.whl"))
 
-if SRC is not None:
-    print("crate source:", SRC)
-    sh(f"rm -rf '{BUILD}' && cp -r '{SRC}' '{BUILD}'")
+wheel = None
+if prebuilt_wheels:
+    wheel = prebuilt_wheels[-1]
+    print(f"Found pre-built wheel: {wheel}")
+else:
+    SRC = None
+    if Path("/kaggle/input").exists():
+        print("inputs:", [str(p) for p in Path("/kaggle/input").iterdir()])
+        hits = sorted(Path("/kaggle/input").glob("*/**/Cargo.toml"))
+        if hits:
+            SRC = hits[0].parent
+        else:
+            tars = sorted(Path("/kaggle/input").glob("*/**/rog2-src.tar.gz"))
+            if tars:
+                sh(f"rm -rf '{BUILD}' && tar -xzf '{tars[0]}' -C '{WORK}'")
+    if SRC is None and not (BUILD / "Cargo.toml").exists():
+        SRC = next((p for p in [Path("rog2-algorithm"), Path(".")] if (p / "Cargo.toml").exists()), None)
 
-assert (BUILD / "Cargo.toml").exists(), f"{BUILD} is not a crate"
-print("build dir:", BUILD.resolve())
+    if SRC is not None:
+        print("crate source:", SRC)
+        sh(f"rm -rf '{BUILD}' && cp -r '{SRC}' '{BUILD}'")
+
+    assert (BUILD / "Cargo.toml").exists(), "No prebuilt wheel or crate source found"
+    print("build dir:", BUILD.resolve())
 """
 )
 
 code(
     r"""
-t0 = time.time()
-r = sh(
-    "maturin build --release --no-default-features "
-    "--features 'pyo3/extension-module,python,cuda' -o dist",
-    cwd=str(BUILD),
-)
-print(f"build took {time.time()-t0:.0f}s, rc={r.returncode}")
-assert r.returncode == 0, "maturin build failed — see stderr above"
-"""
-)
+if wheel is None:
+    if subprocess.run("cargo --version", shell=True, capture_output=True).returncode != 0:
+        sh("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable")
+    sh("cargo --version && rustc --version")
+    sh("pip install -q 'maturin>=1.7,<2.0'")
 
-code(
-    r"""
-import glob
-wheel = sorted(glob.glob(str(BUILD / "dist" / "*.whl")))[-1]
-print("wheel:", wheel)
+    feature_combos = []
+    if has_gpu:
+        feature_combos.append("pyo3/extension-module,python,cuda,wgpu,cpu")
+    feature_combos.extend([
+        "pyo3/extension-module,python,wgpu,cpu",
+        "pyo3/extension-module,python,cpu"
+    ])
+
+    t0 = time.time()
+    built = False
+    for feats in feature_combos:
+        print(f"Attempting build with features: '{feats}'")
+        r = sh(f"maturin build --release --no-default-features --features '{feats}' -o dist", cwd=str(BUILD))
+        if r.returncode == 0:
+            built = True
+            break
+    print(f"build took {time.time()-t0:.0f}s")
+    assert built, "maturin build failed for all feature combinations"
+
+    import glob
+    wheel = sorted(glob.glob(str(BUILD / "dist" / "*.whl")))[-1]
+
+print("installing wheel:", wheel)
 sh(f"pip install --force-reinstall --no-deps -q '{wheel}'")
 
 import importlib
 import rog2_pf
 importlib.reload(rog2_pf)
-print("rog2_pf", rog2_pf.__version__, "backends:", rog2_pf.available_backends())
-assert "cuda" in rog2_pf.available_backends(), "CUDA backend missing from this build"
+backends = rog2_pf.available_backends()
+print("rog2_pf", rog2_pf.__version__, "backends:", backends)
+assert len(backends) > 0, "No backends available in this build"
+BACKEND = "auto"
 print("configs:", len(rog2_pf.BEAM_CONFIGS))
 """
 )
@@ -355,12 +373,12 @@ for hw, tw in pairs:
 live = [w for w in prepared if w is not None]
 
 t0 = time.time()
-gpu = run_beam_batch(live, backend="cuda", with_per_config=True)
+gpu = run_beam_batch(live, backend=BACKEND, with_per_config=True)
 t_gpu_cold = time.time() - t0
 t0 = time.time()
-gpu = run_beam_batch(live, backend="cuda", with_per_config=True)
+gpu = run_beam_batch(live, backend=BACKEND, with_per_config=True)
 t_gpu = time.time() - t0
-print(f"GPU: {t_gpu_cold:.3f}s cold (NVRTC compile), {t_gpu:.3f}s warm")
+print(f"CubeCL ({BACKEND}): {t_gpu_cold:.3f}s cold (warmup/JIT), {t_gpu:.3f}s warm")
 """
 )
 
@@ -460,12 +478,12 @@ change a single row.
 
 code(
     r"""
-a = run_beam_batch(live, backend="cuda")["beam_mean"]
-b = run_beam_batch(live, backend="cuda")["beam_mean"]
+a = run_beam_batch(live, backend=BACKEND)["beam_mean"]
+b = run_beam_batch(live, backend=BACKEND)["beam_mean"]
 same_rerun = all(np.array_equal(x, y) for x, y in zip(a, b))
 print("rerun bit-identical:", same_rerun)
 
-c = run_beam_batch(live, backend="cuda", cube_dim=128)["beam_mean"]
+c = run_beam_batch(live, backend=BACKEND, cube_dim=128)["beam_mean"]
 same_dim = all(np.array_equal(x, y) for x, y in zip(a, c))
 print("cube_dim 64 vs 128 bit-identical:", same_dim)
 assert same_rerun and same_dim
@@ -492,7 +510,7 @@ steps_gpu = rows_gpu * CAND_PER_ROW
 steps_np  = rows_np  * CAND_PER_ROW
 per_row_np = t_np / rows_np
 
-print(f"GPU   : {rows_gpu:>8} rows in {t_gpu:7.3f} s  -> {steps_gpu/t_gpu/1e9:6.2f} G candidate-steps/s")
+print(f"CubeCL: {rows_gpu:>8} rows in {t_gpu:7.3f} s  -> {steps_gpu/t_gpu/1e9:6.2f} G candidate-steps/s")
 print(f"numpy : {rows_np:>8} rows in {t_np:7.3f} s  -> {steps_np/t_np/1e9:6.4f} G candidate-steps/s")
 print(f"\nspeedup on equal work: {(per_row_np * rows_gpu) / t_gpu:.0f}x")
 print(f"numpy extrapolated to all {rows_gpu} rows: {per_row_np*rows_gpu/60:.1f} min")
@@ -502,14 +520,14 @@ print(f"numpy extrapolated to all {rows_gpu} rows: {per_row_np*rows_gpu/60:.1f} 
 code(
     r"""
 # Throughput still climbs with batch size, which is why the API takes every well
-# at once: one well's 14 configs are 14 cubes and cannot fill a T4.
+# at once: one well's 14 configs are 14 cubes and cannot fill a GPU or CPU multi-core device.
 print(f"{'wells':>6}  {'rows':>8}  {'s':>8}  {'G cand-steps/s':>16}")
 for k in [1, 2, 4, 8, 16, len(live)]:
     if k > len(live):
         continue
     sub = live[:k]
-    run_beam_batch(sub, backend="cuda")           # warm
-    t0 = time.time(); run_beam_batch(sub, backend="cuda"); dt = time.time() - t0
+    run_beam_batch(sub, backend=BACKEND)           # warm
+    t0 = time.time(); run_beam_batch(sub, backend=BACKEND); dt = time.time() - t0
     r = sum(len(w["gr"]) for w in sub)
     print(f"{k:>6}  {r:>8}  {dt:>8.3f}  {r*CAND_PER_ROW/dt/1e9:>16.2f}")
 """

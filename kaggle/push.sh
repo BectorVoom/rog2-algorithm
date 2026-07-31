@@ -39,6 +39,10 @@ mkdir -p "$WORK"
 for item in Cargo.toml pyproject.toml README.md src python tests; do
   [ -e "$CRATE/$item" ] && cp -r "$CRATE/$item" "$WORK/"
 done
+if [ -d "$CRATE/dist" ] && ls "$CRATE"/dist/*.whl >/dev/null 2>&1; then
+  mkdir -p "$WORK/dist"
+  cp "$CRATE"/dist/*.whl "$WORK/dist/"
+fi
 tar -czf "$STAGE/rog2-src.tar.gz" -C "$STAGE/pack" rog2-algorithm
 rm -rf "$STAGE/pack"
 
